@@ -2,21 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
-import gzip
 import html
 import json
 import re
 import time
-import threading
 import sqlite3
-import zlib
+import httpx
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 from tqdm import tqdm
 
 STATION_URL = "https://m.shmetro.com/core/shmetro/mdstationinfoback_new.ashx"
@@ -67,39 +63,36 @@ class MetroCrawler:
         self.pause_sec = pause_sec
         self.timeout_sec = timeout_sec
         self.retries = retries
+        self.client = httpx.AsyncClient(headers=HEADERS, timeout=self.timeout_sec)
 
-    def _fetch(self, url: str, params: Dict[str, str]) -> str:
-        full_url = f"{url}?{urlencode(params)}"
+    async def aclose(self) -> None:
+        await self.client.aclose()
+
+    async def _fetch(self, url: str, params: Dict[str, str]) -> str:
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.retries + 1):
             try:
-                req = Request(full_url, headers=HEADERS)
-                with urlopen(req, timeout=self.timeout_sec) as response:
-                    raw = response.read()
-                    encoding = (response.headers.get("Content-Encoding") or "").lower()
-                    if "gzip" in encoding:
-                        raw = gzip.decompress(raw)
-                    elif "deflate" in encoding:
-                        raw = zlib.decompress(raw)
-                    body = raw.decode("utf-8", errors="ignore")
-                time.sleep(self.pause_sec)
+                response = await self.client.get(url, params=params)
+                response.raise_for_status()
+                body = response.text
+                await asyncio.sleep(self.pause_sec)
                 return body
-            except (HTTPError, URLError, TimeoutError) as exc:
+            except (httpx.HTTPError, TimeoutError) as exc:
                 last_exc = exc
                 if attempt < self.retries:
-                    time.sleep(0.8 * attempt)
+                    await asyncio.sleep(0.8 * attempt)
                 else:
                     break
-            except (OSError, zlib.error, gzip.BadGzipFile, UnicodeDecodeError) as exc:
+            except (OSError, UnicodeDecodeError) as exc:
                 last_exc = exc
                 if attempt < self.retries:
-                    time.sleep(0.8 * attempt)
+                    await asyncio.sleep(0.8 * attempt)
                 else:
                     break
-        raise RuntimeError(f"Request failed after {self.retries} retries: {full_url}; error={last_exc}")
+        raise RuntimeError(f"Request failed after {self.retries} retries: {url}; params={params}; error={last_exc}")
 
-    def fetch_stations_by_line(self, line_number: int) -> List[Station]:
-        html_body = self._fetch(STATION_URL, {"act": "slsddl", "ln": str(line_number), "sc": ""})
+    async def fetch_stations_by_line(self, line_number: int) -> List[Station]:
+        html_body = await self._fetch(STATION_URL, {"act": "slsddl", "ln": str(line_number), "sc": ""})
         stations: List[Station] = []
         for match in OPTION_PATTERN.finditer(html_body):
             station_id = match.group("id").strip()
@@ -108,9 +101,9 @@ class MetroCrawler:
                 stations.append(Station(station_id=station_id, station_name=station_name, line=line_number))
         return stations
 
-    def fetch_trip_impedance(self, start_id: str, end_id: str) -> Tuple[Optional[int], bool]:
+    async def fetch_trip_impedance(self, start_id: str, end_id: str) -> Tuple[Optional[int], bool]:
         # print(f"Fetching trip impedance: {start_id} -> {end_id}")
-        body = self._fetch(
+        body = await self._fetch(
             TRIP_URL,
             {
                 "func": "plantrip",
@@ -141,12 +134,12 @@ class MetroCrawler:
             return None, False
 
 
-def build_station_catalog(crawler: MetroCrawler) -> Tuple[List[Station], Dict[int, List[Station]]]:
+async def build_station_catalog(crawler: MetroCrawler) -> Tuple[List[Station], Dict[int, List[Station]]]:
     per_line: Dict[int, List[Station]] = {}
     all_stations: List[Station] = []
 
     for line_number in LINE_NUMBERS:
-        stations = crawler.fetch_stations_by_line(line_number)
+        stations = await crawler.fetch_stations_by_line(line_number)
         per_line[line_number] = stations
         all_stations.extend(stations)
         print(f"Fetched line {line_number}: {len(stations)} stations")
@@ -200,13 +193,14 @@ def canonical_pair(a: str, b: str) -> Tuple[str, str]:
     return (a, b) if a <= b else (b, a)
 
 
-def compute_times(
+async def compute_times(
     crawler: MetroCrawler,
     stations: List[Station],
     db_path: Path,
     workers: int = 16,
 ) -> Tuple[Dict[Tuple[str, str], Optional[int]], UnionFind]:
     ids = [station.station_id for station in stations]
+    id_set = set(ids)
     uf = UnionFind(ids)
 
     # prepare time map
@@ -221,6 +215,8 @@ def compute_times(
     loaded = 0
     for a, b, mins in cur.fetchall():
         ca, cb = canonical_pair(a, b)
+        if ca not in id_set or cb not in id_set:
+            continue
         time_map[(ca, cb)] = mins
         time_map[(cb, ca)] = mins
         if ca != cb and mins == 0:
@@ -229,44 +225,80 @@ def compute_times(
     if loaded:
         print(f"Recovered rows from DB: {loaded}")
 
+    # Retry previously failed rows first (minutes IS NULL), likely from transient server errors.
+    cur.execute("SELECT from_id, to_id FROM times WHERE minutes IS NULL")
+    null_pairs: List[Tuple[str, str]] = []
+    for a, b in cur.fetchall():
+        ca, cb = canonical_pair(a, b)
+        if ca == cb:
+            continue
+        if ca not in id_set or cb not in id_set:
+            continue
+        null_pairs.append((ca, cb))
+    if null_pairs:
+        print(f"Found {len(null_pairs)} NULL rows; retrying these first")
+
     total_pairs = len(ids) * (len(ids) - 1) // 2
-    completed_pairs = sum(1 for (a, b) in time_map if a < b)
+    completed_pairs = sum(
+        1
+        for i in range(len(ids))
+        for j in range(i + 1, len(ids))
+        if time_map.get((ids[i], ids[j])) is not None
+    )
     remaining_pairs = total_pairs - completed_pairs
     print(f"Resuming compute_times: {completed_pairs} done, {remaining_pairs} remaining (of {total_pairs})")
 
-    # build list of pairs to query
-    pairs: List[Tuple[str, str]] = []
+    # build list of normal missing pairs
+    missing_pairs: List[Tuple[str, str]] = []
     for i in range(len(ids)):
         for j in range(i + 1, len(ids)):
             a, b = canonical_pair(ids[i], ids[j])
             if (a, b) not in time_map:
-                pairs.append((a, b))
+                missing_pairs.append((a, b))
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    # query order: retry NULL rows first, then missing rows
+    pairs: List[Tuple[str, str]] = []
+    seen_pairs: set[Tuple[str, str]] = set()
+    for pair in null_pairs + missing_pairs:
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        pairs.append(pair)
 
-    def fetch_pair(pair: Tuple[str, str]) -> Tuple[str, str, Optional[int], bool]:
+    async def fetch_pair(pair: Tuple[str, str]) -> Tuple[str, str, Optional[int], bool]:
         a, b = pair
-        mins, same = crawler.fetch_trip_impedance(a, b)
+        mins, same = await crawler.fetch_trip_impedance(a, b)
         return a, b, mins, same
 
-    lock = threading.Lock()
-
-    # run with thread pool and write to sqlite after each fetch
+    # run with async task pool and write to sqlite after each fetch
     with tqdm(total=total_pairs, initial=completed_pairs, desc="Pair crawl", unit="pair") as pbar:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_pair = {executor.submit(fetch_pair, pair): pair for pair in pairs}
-            for future in as_completed(future_to_pair):
+        pending: Dict[asyncio.Task[Tuple[str, str, Optional[int], bool]], Tuple[str, str]] = {}
+        pair_iter = iter(pairs)
+
+        def fill_pending() -> None:
+            while len(pending) < workers:
                 try:
-                    a, b, mins, same = future.result()
+                    pair = next(pair_iter)
+                except StopIteration:
+                    break
+                task = asyncio.create_task(fetch_pair(pair))
+                pending[task] = pair
+
+        fill_pending()
+
+        while pending:
+            done, _ = await asyncio.wait(pending.keys(), return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                a, b = pending.pop(task)
+                try:
+                    a, b, mins, same = task.result()
                 except Exception:
-                    a, b = future_to_pair[future]
                     try:
-                        mins, same = crawler.fetch_trip_impedance(a, b)
+                        mins, same = await crawler.fetch_trip_impedance(a, b)
                     except Exception:
                         mins, same = None, False
                 if same:
-                    with lock:
-                        uf.union(a, b)
+                    uf.union(a, b)
                     mins = 0
 
                 # update map in both directions for downstream consumers
@@ -279,8 +311,11 @@ def compute_times(
                     (a, b, mins),
                 )
 
-                completed_pairs += 1
-                pbar.update(1)
+                if mins is not None:
+                    completed_pairs += 1
+                    pbar.update(1)
+
+            fill_pending()
 
     conn.close()
     return time_map, uf
@@ -384,8 +419,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Shanghai metro travel-time accessibility crawler")
     parser.add_argument("--output", default="output", help="Output directory")
     parser.add_argument("--pause", type=float, default=0.15, help="Pause seconds between HTTP calls")
-    parser.add_argument("--timeout", type=int, default=15, help="HTTP timeout seconds")
-    parser.add_argument("--retries", type=int, default=3, help="Retry count for failed HTTP calls")
+    parser.add_argument("--timeout", type=int, default=5, help="HTTP timeout seconds")
+    parser.add_argument("--retries", type=int, default=1, help="Retry count for failed HTTP calls")
     parser.add_argument(
         "--workers",
         type=int,
@@ -395,31 +430,33 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+async def main() -> None:
     args = parse_args()
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     crawler = MetroCrawler(pause_sec=args.pause, timeout_sec=args.timeout, retries=args.retries)
+    try:
+        stations_csv_path = output_dir / "stations_all.csv"
+        stations_md_path = output_dir / "stations_by_line.md"
 
-    stations_csv_path = output_dir / "stations_all.csv"
-    stations_md_path = output_dir / "stations_by_line.md"
+        if stations_csv_path.exists() and stations_md_path.exists():
+            print("Station files found; skip station crawling and load from cache")
+            stations, per_line = load_station_catalog_from_csv(stations_csv_path)
+        else:
+            stations, per_line = await build_station_catalog(crawler)
+            write_stations_human_readable(per_line, output_dir)
 
-    if stations_csv_path.exists() and stations_md_path.exists():
-        print("Station files found; skip station crawling and load from cache")
-        stations, per_line = load_station_catalog_from_csv(stations_csv_path)
-    else:
-        stations, per_line = build_station_catalog(crawler)
-        write_stations_human_readable(per_line, output_dir)
+        db_path = output_dir / "time_map.db"
+        time_map, uf = await compute_times(crawler, stations, db_path, workers=args.workers)
 
-    db_path = output_dir / "time_map.db"
-    time_map, uf = compute_times(crawler, stations, db_path, workers=args.workers)
-
-    write_time_matrix(stations, time_map, output_dir)
-    write_average_ranking(stations, time_map, uf, output_dir)
+        write_time_matrix(stations, time_map, output_dir)
+        write_average_ranking(stations, time_map, uf, output_dir)
+    finally:
+        await crawler.aclose()
 
     print(f"Done. Output files saved in: {output_dir.resolve()}")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
