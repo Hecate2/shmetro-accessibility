@@ -1,0 +1,56 @@
+# Shanghai Metro Accessibility Crawler
+
+This script fetches station data from Shanghai Metro official mobile endpoints, computes pairwise travel time costs, and outputs station ranking by average travel time.
+
+## What it does
+
+1. Fetches all stations for lines:
+   - `1..18`
+   - `41` (浦江线)
+   - `51` (市域机场线)
+2. Writes human-readable station lists.
+3. Queries travel time between station pairs using:
+   - `func=plantrip`
+   - `impedancevalue` as travel-time minutes.
+4. Uses symmetry optimization:
+   - queries only `A -> B` for `A < B`
+   - fills `B -> A` with same value.
+5. Treats empty `pathList` as same physical station and assigns `0`.
+6. Computes average travel time per station to all **other non-equivalent** stations.
+7. If `output/stations_all.csv` and `output/stations_by_line.md` already exist, station crawling is skipped and station data is loaded from disk.
+8. Shows pair-crawling progress with ETA using `tqdm`.
+
+## Run
+
+```bash
+python3 shmetro_accessibility.py --output output
+```
+
+Optional flags:
+
+- `--workers 16` number of parallel worker threads used when collecting pairwise times (default 16).
+- `--pause 0.15` pause seconds between requests.
+- `--timeout 15` HTTP timeout.
+- `--retries 3` request retry count.
+
+Progress display:
+
+- Pair crawling uses a `tqdm` progress bar with elapsed time, speed, and ETA.
+
+The crawler will resume from an existing `time_map_checkpoint.json` if rerun; you can interrupt with Ctrl‑C and restart without losing work.
+
+## Output files
+
+- `output/stations_by_line.md` human-readable station list grouped by line.
+- `output/stations_all.csv` full station table.
+- `output/time_map_checkpoint.json` legacy JSON checkpoint (rows are still saved for debugging).
+- `output/time_map.db` SQLite database storing every fetched pair and enabling resume.
+- `output/travel_time_matrix.csv` full from/to matrix.
+- `output/travel_time_pairs.md` human-readable pair table (upper triangle only).
+- `output/average_time_ranking.csv` ranking by average minutes.
+- `output/average_time_ranking.md` human-readable ranking.
+
+## Notes
+
+- Full execution may take a while because the number of station pairs is large.
+- If API behavior changes, parsing may need adjustment.
