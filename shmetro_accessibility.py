@@ -7,9 +7,8 @@ import csv
 import html
 import json
 import re
-import time
-import sqlite3
 import httpx
+import aiosqlite
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -177,16 +176,27 @@ def load_station_catalog_from_csv(csv_path: Path) -> Tuple[List[Station], Dict[i
     return unique_stations, per_line
 
 
-def init_db(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path), timeout=30, isolation_level=None)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA temp_store=MEMORY;")
-    conn.execute("PRAGMA busy_timeout=5000;")
-    conn.execute(
+async def init_db(db_path: Path) -> aiosqlite.Connection:
+    conn = await aiosqlite.connect(str(db_path), timeout=30, isolation_level=None)
+    await conn.execute("PRAGMA journal_mode=WAL;")
+    await conn.execute("PRAGMA synchronous=NORMAL;")
+    await conn.execute("PRAGMA temp_store=MEMORY;")
+    await conn.execute("PRAGMA busy_timeout=5000;")
+    await conn.execute(
         "CREATE TABLE IF NOT EXISTS times (from_id TEXT NOT NULL, to_id TEXT NOT NULL, minutes INTEGER, PRIMARY KEY(from_id,to_id))"
     )
     return conn
+
+
+async def flush_wal_logs(db_path: Path) -> None:
+    if not db_path.exists():
+        return
+    conn = await aiosqlite.connect(str(db_path), timeout=30, isolation_level=None)
+    try:
+        await conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        print("WAL checkpoint(TRUNCATE) done before crawl")
+    finally:
+        await conn.close()
 
 
 def canonical_pair(a: str, b: str) -> Tuple[str, str]:
@@ -208,12 +218,13 @@ async def compute_times(
     for station_id in ids:
         time_map[(station_id, station_id)] = 0
 
-    conn = init_db(db_path)
-    cur = conn.cursor()
+    conn = await init_db(db_path)
 
-    cur.execute("SELECT from_id, to_id, minutes FROM times")
+    cur = await conn.execute("SELECT from_id, to_id, minutes FROM times")
+    db_rows = await cur.fetchall()
+    await cur.close()
     loaded = 0
-    for a, b, mins in cur.fetchall():
+    for a, b, mins in db_rows:
         ca, cb = canonical_pair(a, b)
         if ca not in id_set or cb not in id_set:
             continue
@@ -226,9 +237,11 @@ async def compute_times(
         print(f"Recovered rows from DB: {loaded}")
 
     # Retry previously failed rows first (minutes IS NULL), likely from transient server errors.
-    cur.execute("SELECT from_id, to_id FROM times WHERE minutes IS NULL")
+    cur = await conn.execute("SELECT from_id, to_id FROM times WHERE minutes IS NULL")
+    null_rows = await cur.fetchall()
+    await cur.close()
     null_pairs: List[Tuple[str, str]] = []
-    for a, b in cur.fetchall():
+    for a, b in null_rows:
         ca, cb = canonical_pair(a, b)
         if ca == cb:
             continue
@@ -306,7 +319,7 @@ async def compute_times(
                 time_map[(b, a)] = mins
 
                 # write a single canonical row into database immediately
-                cur.execute(
+                await conn.execute(
                     "INSERT OR REPLACE INTO times(from_id,to_id,minutes) VALUES(?,?,?)",
                     (a, b, mins),
                 )
@@ -317,7 +330,7 @@ async def compute_times(
 
             fill_pending()
 
-    conn.close()
+    await conn.close()
     return time_map, uf
 
 
@@ -434,6 +447,8 @@ async def main() -> None:
     args = parse_args()
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
+    db_path = output_dir / "time_map.db"
+    await flush_wal_logs(db_path)
 
     crawler = MetroCrawler(pause_sec=args.pause, timeout_sec=args.timeout, retries=args.retries)
     try:
@@ -447,7 +462,6 @@ async def main() -> None:
             stations, per_line = await build_station_catalog(crawler)
             write_stations_human_readable(per_line, output_dir)
 
-        db_path = output_dir / "time_map.db"
         time_map, uf = await compute_times(crawler, stations, db_path, workers=args.workers)
 
         write_time_matrix(stations, time_map, output_dir)
