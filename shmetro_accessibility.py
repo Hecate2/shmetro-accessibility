@@ -19,7 +19,7 @@ TRIP_URL = "https://m.shmetro.com/interface/plantrip/pt.aspx"
 LINE_NUMBERS = [*range(1, 19), 41, 51]
 OPTION_PATTERN = re.compile(r'<option\s+value="(?P<id>[^"]+)"[^>]*>(?P<name>.*?)</option>', re.IGNORECASE)
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+    # "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
     "Accept": "application/json, text/html, */*",
     "Accept-Encoding": "gzip, deflate",
 }
@@ -71,7 +71,7 @@ class MetroCrawler:
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.retries + 1):
             try:
-                response = await self.client.get(url, params=params)
+                response = await self.client.get(url, params=params, timeout=self.timeout_sec)
                 response.raise_for_status()
                 body = response.text
                 await asyncio.sleep(self.pause_sec)
