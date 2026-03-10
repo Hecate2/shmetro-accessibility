@@ -74,6 +74,20 @@ class RouteResult:
     reason: str
 
 
+@dataclass(frozen=True)
+class AMapCredentialConfig:
+    key: str
+    secret: str
+
+
+@dataclass
+class AMapCredentialRuntime:
+    key: str
+    secret: str
+    station_search_limiter: AsyncQPSLimiter
+    route_plan_limiter: AsyncQPSLimiter
+
+
 class AsyncQPSLimiter:
     def __init__(self, qps: float) -> None:
         if qps <= 0:
@@ -115,6 +129,48 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
         if key not in merged:
             merged[key] = value
     return merged
+
+
+def load_amap_credentials(env_values: Dict[str, str]) -> List[AMapCredentialConfig]:
+    credentials: List[AMapCredentialConfig] = []
+
+    key = env_values.get("KEY")
+    secret = env_values.get("SEC")
+    if key and secret:
+        credentials.append(AMapCredentialConfig(key=key, secret=secret))
+
+    indexed_keys: Dict[int, str] = {}
+    indexed_secs: Dict[int, str] = {}
+    for env_key, env_value in env_values.items():
+        key_match = re.fullmatch(r"AMAP_KEY_(\d+)", env_key)
+        if key_match:
+            indexed_keys[int(key_match.group(1))] = env_value
+            continue
+        sec_match = re.fullmatch(r"AMAP_SEC_(\d+)", env_key)
+        if sec_match:
+            indexed_secs[int(sec_match.group(1))] = env_value
+
+    for index in sorted(set(indexed_keys) | set(indexed_secs)):
+        indexed_key = indexed_keys.get(index)
+        indexed_sec = indexed_secs.get(index)
+        if not indexed_key or not indexed_sec:
+            raise RuntimeError(f"Missing AMAP_KEY_{index} or AMAP_SEC_{index}")
+        credentials.append(AMapCredentialConfig(key=indexed_key, secret=indexed_sec))
+
+    deduped: List[AMapCredentialConfig] = []
+    seen_pairs: set[Tuple[str, str]] = set()
+    for credential in credentials:
+        pair = (credential.key, credential.secret)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        deduped.append(credential)
+
+    if not deduped:
+        raise RuntimeError(
+            "Missing AMap credentials. Provide KEY/SEC or one or more AMAP_KEY_n/AMAP_SEC_n pairs in the environment"
+        )
+    return deduped
 
 
 def normalize_text(value: str) -> str:
@@ -264,34 +320,56 @@ def select_transit(route_payload: Dict[str, Any], from_id: str, to_id: str) -> R
 class AMapClient:
     def __init__(
         self,
-        key: str,
-        secret: str,
+        credentials: Sequence[AMapCredentialConfig],
         pause_sec: float = 0.0,
         timeout_sec: int = 20,
         retries: int = 4,
         station_search_qps: float = 3.1,
         route_plan_qps: float = 3.1,
     ) -> None:
-        self.key = key
-        self.secret = secret
         self.pause_sec = pause_sec
         self.timeout_sec = timeout_sec
         self.retries = retries
         self.client = httpx.AsyncClient(timeout=self.timeout_sec)
-        self.station_search_limiter = AsyncQPSLimiter(station_search_qps)
-        self.route_plan_limiter = AsyncQPSLimiter(route_plan_qps)
+        self.credentials = [
+            AMapCredentialRuntime(
+                key=credential.key,
+                secret=credential.secret,
+                station_search_limiter=AsyncQPSLimiter(station_search_qps),
+                route_plan_limiter=AsyncQPSLimiter(route_plan_qps),
+            )
+            for credential in credentials
+        ]
+        self._station_search_lock = asyncio.Lock()
+        self._route_plan_lock = asyncio.Lock()
+        self._station_search_index = 0
+        self._route_plan_index = 0
 
     async def aclose(self) -> None:
         await self.client.aclose()
 
-    def sign_params(self, params: Dict[str, Any]) -> str:
-        raw = "&".join(f"{key}={params[key]}" for key in sorted(params)) + self.secret
+    def sign_params(self, params: Dict[str, Any], credential: AMapCredentialRuntime) -> str:
+        raw = "&".join(f"{key}={params[key]}" for key in sorted(params)) + credential.secret
         return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
-    async def _request_json(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _acquire_station_search_credential(self) -> AMapCredentialRuntime:
+        async with self._station_search_lock:
+            credential = self.credentials[self._station_search_index]
+            self._station_search_index = (self._station_search_index + 1) % len(self.credentials)
+        await credential.station_search_limiter.acquire()
+        return credential
+
+    async def _acquire_route_plan_credential(self) -> AMapCredentialRuntime:
+        async with self._route_plan_lock:
+            credential = self.credentials[self._route_plan_index]
+            self._route_plan_index = (self._route_plan_index + 1) % len(self.credentials)
+        await credential.route_plan_limiter.acquire()
+        return credential
+
+    async def _request_json(self, url: str, params: Dict[str, Any], credential: AMapCredentialRuntime) -> Dict[str, Any]:
         signed_params = {key: str(value) for key, value in params.items() if value is not None}
-        signed_params["key"] = self.key
-        signed_params["sig"] = self.sign_params(signed_params)
+        signed_params["key"] = credential.key
+        signed_params["sig"] = self.sign_params(signed_params, credential)
 
         last_error: Optional[str] = None
         for attempt in range(1, self.retries + 1):
@@ -322,7 +400,7 @@ class AMapClient:
         raise RuntimeError(f"AMap request failed after retries: {url}; error={last_error}")
 
     async def search_station_candidates(self, query_text: str) -> List[Dict[str, Any]]:
-        await self.station_search_limiter.acquire()
+        credential = await self._acquire_station_search_credential()
         payload = await self._request_json(
             AMAP_POI_URL,
             {
@@ -334,11 +412,12 @@ class AMapClient:
                 "page": "1",
                 "output": "JSON",
             },
+            credential,
         )
         return list(payload.get("pois") or [])
 
     async def route_transit(self, origin: str, destination: str, service_date: str, service_time: str, strategy: str) -> Dict[str, Any]:
-        await self.route_plan_limiter.acquire()
+        credential = await self._acquire_route_plan_credential()
         return await self._request_json(
             AMAP_TRANSIT_URL,
             {
@@ -355,6 +434,7 @@ class AMapClient:
                 "show_fields": "cost",
                 "output": "JSON",
             },
+            credential,
         )
 
 
@@ -894,18 +974,14 @@ async def main() -> None:
         raise RuntimeError(f"Station catalog not found: {stations_csv}")
 
     env_values = load_env_file(Path(args.env_file))
-    key = env_values.get("KEY")
-    secret = env_values.get("SEC")
-    if not key or not secret:
-        raise RuntimeError("Missing KEY or SEC in environment")
+    credentials = load_amap_credentials(env_values)
 
     stations = load_station_catalog_from_csv(stations_csv)
     db_path = Path(args.db_path)
     conn = await init_db(db_path)
 
     client = AMapClient(
-        key=key,
-        secret=secret,
+        credentials=credentials,
         pause_sec=args.pause,
         timeout_sec=args.timeout,
         retries=args.retries,

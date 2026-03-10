@@ -14,17 +14,35 @@ This script now uses AMap Web Service APIs to estimate directed travel time from
 - Route selection rejects any plan containing taxi or maglev.
 - Travel times are directional `A -> B`, not assumed symmetric.
 
+## Prerequisites
+
+- You need an AMap Web Service key.
+- The AMap account should complete personal developer verification before using the crawler.
+
 ## Inputs
 
 - `output/stations_all.csv`
   - Existing station catalog used as the node list.
 - `.env`
-  - Must contain:
+  - You can use a single credential pair:
 
 ```bash
 KEY=your_amap_key
 SEC=your_amap_secret
 ```
+
+  - Or multiple credential pairs for higher aggregate concurrency:
+
+```bash
+AMAP_KEY_1=your_amap_key_1
+AMAP_SEC_1=your_amap_secret_1
+AMAP_KEY_2=your_amap_key_2
+AMAP_SEC_2=your_amap_secret_2
+AMAP_KEY_3=your_amap_key_3
+AMAP_SEC_3=your_amap_secret_3
+```
+
+Put the AMap Web Service key in `KEY` or `AMAP_KEY_n`, and put the digital signature secret in `SEC` or `AMAP_SEC_n`.
 
 The script computes `sig` automatically for every AMap request.
 
@@ -52,10 +70,10 @@ Important flags:
 - `--compute-only` skips network calls and rebuilds outputs from the SQLite cache.
 - `--route-workers` controls concurrent route requests.
 - `--resolve-workers` controls concurrent station matching requests.
-- `--station-search-qps` hard-caps station search requests and defaults to `3.1` QPS.
-- `--route-plan-qps` hard-caps route planning requests and defaults to `3.1` QPS.
+- `--station-search-qps` hard-caps station search requests per credential and defaults to `3.1` QPS.
+- `--route-plan-qps` hard-caps route planning requests per credential and defaults to `3.1` QPS.
 - `--pause` adds an optional extra delay after successful AMap calls and defaults to `0`.
-- `--strategy 8` uses AMap shortest-time public transit mode by default.
+- `--strategy 7` uses AMap metro-priority public transit mode by default.
 
 ## SQLite Schema
 
@@ -84,6 +102,7 @@ Tables:
 ## Notes
 
 - The route matrix is directional because entrances, walking time, and service patterns can differ by direction.
-- The script hard-caps both station search and route planning to `3.5` QPS by default.
+- Each credential pair has an independent `3.1` QPS cap for station search and route planning by default.
+- When multiple credential pairs are configured, the crawler rotates across them to raise aggregate throughput while keeping each pair inside its own cap.
 - AMap can still rate-limit requests, so modest concurrency is safer for long runs.
 - If some station nodes remain unresolved, their routes will be left blank in the outputs until a later rerun resolves them.
