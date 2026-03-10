@@ -984,7 +984,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--route-plan-qps", type=float, default=3.1, help="Hard QPS cap for AMap route planning requests")
     parser.add_argument("--date", default=default_service_date(), help="Service date in YYYY-MM-DD, defaults to a workday")
     parser.add_argument("--time", default="7:15", help="Departure time, for example 7:15")
-    parser.add_argument("--strategy", default="8", help="AMap transit strategy, default 0 is the auto-recommended route")
+    parser.add_argument("--strategy", default="0", help="AMap transit strategy, default 0 is the auto-recommended route")
     parser.add_argument("--resolve-only", action="store_true", help="Only resolve station nodes without crawling routes")
     parser.add_argument("--compute-only", action="store_true", help="Skip network calls and only rebuild outputs from sqlite")
     return parser.parse_args()
