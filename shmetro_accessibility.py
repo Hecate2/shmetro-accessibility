@@ -21,7 +21,6 @@ from tqdm import tqdm
 AMAP_POI_URL = "https://restapi.amap.com/v3/place/text"
 AMAP_TRANSIT_URL = "https://restapi.amap.com/v5/direction/transit/integrated"
 SHANGHAI_CITY_CODE = "021"
-MAGLEV_KEYWORDS = ("磁浮", "磁悬浮")
 RETRIABLE_INFOS = {
     "CUQPS_HAS_EXCEEDED_THE_LIMIT",
     "DAILY_QUERY_OVER_LIMIT",
@@ -217,14 +216,17 @@ def transit_has_forbidden_mode(transit: Dict[str, Any]) -> Optional[str]:
     for segment in transit.get("segments") or []:
         if segment.get("taxi"):
             return "contains_taxi"
-        for busline in ((segment.get("bus") or {}).get("buslines") or []):
-            text = json.dumps(busline, ensure_ascii=False)
-            if any(keyword in text for keyword in MAGLEV_KEYWORDS):
-                return "contains_maglev"
-        railway = segment.get("railway") or {}
-        if railway and any(keyword in json.dumps(railway, ensure_ascii=False) for keyword in MAGLEV_KEYWORDS):
-            return "contains_maglev"
     return None
+
+
+def route_result_is_final(result: Optional[RouteResult]) -> bool:
+    if result is None:
+        return False
+    if result.status == "done":
+        return True
+    if result.status == "no_valid_route" and result.reason != "contains_maglev":
+        return True
+    return False
 
 
 def select_transit(route_payload: Dict[str, Any], from_id: str, to_id: str) -> RouteResult:
@@ -233,6 +235,7 @@ def select_transit(route_payload: Dict[str, Any], from_id: str, to_id: str) -> R
         return RouteResult(from_id, to_id, "no_valid_route", None, None, "", "no_transits")
 
     last_reason = "no_valid_transit"
+    best_result: Optional[RouteResult] = None
     for index, transit in enumerate(transits):
         forbidden_reason = transit_has_forbidden_mode(transit)
         if forbidden_reason:
@@ -242,7 +245,7 @@ def select_transit(route_payload: Dict[str, Any], from_id: str, to_id: str) -> R
         if duration_seconds is None:
             last_reason = "missing_duration"
             continue
-        return RouteResult(
+        candidate = RouteResult(
             from_id=from_id,
             to_id=to_id,
             status="done",
@@ -251,6 +254,10 @@ def select_transit(route_payload: Dict[str, Any], from_id: str, to_id: str) -> R
             summary=summarize_transit(transit),
             reason="ok",
         )
+        if best_result is None or best_result.duration_seconds is None or duration_seconds < best_result.duration_seconds:
+            best_result = candidate
+    if best_result is not None:
+        return best_result
     return RouteResult(from_id, to_id, "no_valid_route", None, None, "", last_reason)
 
 
@@ -340,9 +347,9 @@ class AMapClient:
                 "city1": SHANGHAI_CITY_CODE,
                 "city2": SHANGHAI_CITY_CODE,
                 "strategy": strategy,
-                "AlternativeRoute": "3",
+                "AlternativeRoute": "8",
                 "nightflag": "0",
-                "max_trans": "4",
+                "max_trans": "5",
                 "date": service_date,
                 "time": service_time,
                 "show_fields": "cost",
@@ -579,10 +586,8 @@ async def crawl_routes(
             if origin.station_id not in resolved_ids or destination.station_id not in resolved_ids:
                 continue
             current = existing.get((origin.station_id, destination.station_id))
-            # treat both successful results and explicit "no_valid_route" as finished
-            # (no_valid_route is often used when origin==destination in previous runs,
-            #  so we want to make sure we don't retry those rows)
-            if current and current.status in {"done", "no_valid_route"}:
+            # allow historical contains_maglev rows to be retried after relaxing the filter
+            if route_result_is_final(current):
                 continue
             pairs.append((origin, destination))
 
@@ -594,7 +599,7 @@ async def crawl_routes(
             if origin.station_id not in resolved_ids or destination.station_id not in resolved_ids:
                 continue
             current = existing.get((origin.station_id, destination.station_id))
-            if current and current.status in {"done", "no_valid_route"}:
+            if route_result_is_final(current):
                 completed += 1
 
     total = completed + len(pairs)
@@ -873,7 +878,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--route-plan-qps", type=float, default=3.1, help="Hard QPS cap for AMap route planning requests")
     parser.add_argument("--date", default=default_service_date(), help="Service date in YYYY-MM-DD, defaults to a workday")
     parser.add_argument("--time", default="7:15", help="Departure time, for example 7:15")
-    parser.add_argument("--strategy", default="8", help="AMap transit strategy, default 8 means shortest time")
+    parser.add_argument("--strategy", default="8", help="AMap transit strategy, default 0 is the auto-recommended route")
     parser.add_argument("--resolve-only", action="store_true", help="Only resolve station nodes without crawling routes")
     parser.add_argument("--compute-only", action="store_true", help="Skip network calls and only rebuild outputs from sqlite")
     return parser.parse_args()
