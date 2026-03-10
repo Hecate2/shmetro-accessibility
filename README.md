@@ -106,3 +106,19 @@ Tables:
 - When multiple credential pairs are configured, the crawler rotates across them to raise aggregate throughput while keeping each pair inside its own cap.
 - AMap can still rate-limit requests, so modest concurrency is safer for long runs.
 - If some station nodes remain unresolved, their routes will be left blank in the outputs until a later rerun resolves them.
+
+## Weekday assumptions ⚠️
+
+By default `shmetro_accessibility.py` queries travel time durations using a **weekday morning** departure time. The logic treats the query date as a normal workday, which matches typical rush‑hour conditions that the dataset aims to capture.
+
+> **Special holiday notice:** public transit schedules on Chinese holidays (e.g. Spring Festival, National Day, Labor Day) often deviate significantly from regular weekday service. The crawler does **not** account for these variations – it will still send requests as if the date were an ordinary weekday.
+
+### Handling holidays
+
+1. **Manually override the date/time.** Use `--date YYYY-MM-DD` and `--time HH:MM` to pick a non‑holiday weekday when you know service is normal. For example:
+   ```bash
+   python3 shmetro_accessibility.py --date 2026-03-10 --time 07:15
+   ```
+2. **Filter results later.** After crawling, drop or flag any rows whose date corresponds to a holiday according to your own calendar.
+
+Keeping these caveats in mind will help avoid misleading travel‑time estimates during atypical service periods.
