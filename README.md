@@ -1,58 +1,89 @@
 # Shanghai Metro Accessibility Crawler
 
-This script uses asynchronous HTTP requests to fetch station data from Shanghai Metro mobile endpoints, computes pairwise travel-time costs, stores results in a WAL‑mode SQLite database, and produces human-readable and CSV outputs including an average travel-time ranking.
+This script now uses AMap Web Service APIs to estimate directed travel time from every Shanghai metro station node to every other station node around a weekday morning departure time.
 
-## What it does
+## What Changed
 
-1. Fetches all stations for lines:
-   - `1..18`
-   - `41` (浦江线)
-   - `51` (市域机场线)
-2. Writes or loads human-readable station lists cached in CSV/Markdown.
-3. Queries travel time between station pairs using:
-   - `func=plantrip`
-   - `impedancevalue` as travel-time minutes.
-4. Uses symmetry optimization:
-   - queries only `A -> B` for `A < B`
-   - fills `B -> A` with same value.
-5. Treats empty `pathList` as same physical station and assigns `0`.
-6. Computes average travel time per station to all **other non-equivalent** stations.
-7. If `output/stations_all.csv` and `output/stations_by_line.md` already exist, station crawling is skipped and station data is loaded from disk.
-8. Shows pair-crawling progress with ETA using `tqdm`. The crawler retries failed requests and can recover from partial data stored in the database.
+- Route planning uses AMap public transit planning instead of the Shanghai Metro mobile site.
+- Crawling is fully asynchronous and concurrency is configurable.
+- Progress is persisted in SQLite so interrupted runs can resume.
+- Station nodes stay line-specific and are not merged by identical names.
+  - Example: `2号线 浦东南路` and `14号线 浦东南路` are treated as different nodes.
+  - Example: `1/3/4号线 上海火车站` are treated as different nodes.
+- AMap station matching prefers line-specific subway exits so inconvenient transfers are reflected in walking time.
+- Route selection rejects any plan containing taxi or maglev.
+- Travel times are directional `A -> B`, not assumed symmetric.
+
+## Inputs
+
+- `output/stations_all.csv`
+  - Existing station catalog used as the node list.
+- `.env`
+  - Must contain:
+
+```bash
+KEY=your_amap_key
+SEC=your_amap_secret
+```
+
+The script computes `sig` automatically for every AMap request.
 
 ## Run
 
+Resolve station nodes and crawl all directed routes:
+
 ```bash
-python3 shmetro_accessibility.py --output output        # default crawling mode
-python3 shmetro_accessibility.py --output output --compute-only  # use existing cache, skip network
+python3 shmetro_accessibility.py
 ```
 
-Optional flags:
+Useful options:
 
-- `--workers 16` number of parallel tasks used when collecting pairwise times (default 16).
-- `--pause 0.15` pause seconds between requests.
-- `--timeout 15` HTTP timeout.
-- `--retries 3` request retry count.
-- `--compute-only` skip network crawling and regenerate outputs from cache (requires existing station files and database).
+```bash
+python3 shmetro_accessibility.py --resolve-only
+python3 shmetro_accessibility.py --compute-only
+python3 shmetro_accessibility.py --route-workers 4 --resolve-workers 2
+python3 shmetro_accessibility.py --date 2026-03-10 --time 7:15
+python3 shmetro_accessibility.py --db-path output/amap_transit.db
+```
 
-Progress display:
+Important flags:
 
-- Pair crawling uses a `tqdm` progress bar with elapsed time, speed, and ETA.
+- `--resolve-only` only resolves station nodes to AMap POIs or exits.
+- `--compute-only` skips network calls and rebuilds outputs from the SQLite cache.
+- `--route-workers` controls concurrent route requests.
+- `--resolve-workers` controls concurrent station matching requests.
+- `--station-search-qps` hard-caps station search requests and defaults to `3.1` QPS.
+- `--route-plan-qps` hard-caps route planning requests and defaults to `3.1` QPS.
+- `--pause` adds an optional extra delay after successful AMap calls and defaults to `0`.
+- `--strategy 8` uses AMap shortest-time public transit mode by default.
 
-The crawler will resume from an existing `time_map_checkpoint.json` if rerun; you can interrupt with Ctrl‑C and restart without losing work.
+## SQLite Schema
 
-## Output files
+Default database: `output/amap_transit.db`
 
-- `output/stations_by_line.md` human-readable station list grouped by line.
-- `output/stations_all.csv` full station table.
-- `output/time_map_checkpoint.json` legacy JSON checkpoint (rows are still saved for debugging).
-- `output/time_map.db` SQLite database storing every fetched pair and enabling resume.
-- `output/travel_time_matrix.csv` full from/to matrix.
-- `output/travel_time_pairs.md` human-readable pair table (upper triangle only).
-- `output/average_time_ranking.csv` ranking by average minutes.
-- `output/average_time_ranking.md` human-readable ranking.
+Tables:
+
+- `station_amap`
+  - Stores the matched AMap POI or exit for each line-specific station node.
+- `route_times`
+  - Stores directed route results from `from_id -> to_id`.
+  - `status='done'` means a valid public-transit route was found.
+  - `status='no_valid_route'` means AMap returned no acceptable plan after filtering taxi and maglev.
+  - `status='error'` means the request failed and will be retried on the next run.
+
+## Output Files
+
+- `output/amap_station_matches.csv`
+- `output/amap_station_matches.md`
+- `output/amap_transit.db`
+- `output/travel_time_matrix.csv`
+- `output/travel_time_pairs.md`
+- `output/average_time_ranking.csv`
+- `output/average_time_ranking.md`
 
 ## Notes
 
-- Full execution may take a while because the number of station pairs is large.
-- If API behavior changes, parsing may need adjustment.
+- The route matrix is directional because entrances, walking time, and service patterns can differ by direction.
+- The script hard-caps both station search and route planning to `3.5` QPS by default.
+- AMap can still rate-limit requests, so modest concurrency is safer for long runs.
+- If some station nodes remain unresolved, their routes will be left blank in the outputs until a later rerun resolves them.
