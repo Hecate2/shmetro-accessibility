@@ -203,6 +203,31 @@ def canonical_pair(a: str, b: str) -> Tuple[str, str]:
     return (a, b) if a <= b else (b, a)
 
 
+async def load_time_map_and_uf(db_path: Path, stations: List[Station]) -> Tuple[Dict[Tuple[str, str], Optional[int]], UnionFind]:
+    ids = [station.station_id for station in stations]
+    uf = UnionFind(ids)
+    time_map: Dict[Tuple[str, str], Optional[int]] = {}
+    for sid in ids:
+        time_map[(sid, sid)] = 0
+
+    if not db_path.exists():
+        return time_map, uf
+
+    conn = await aiosqlite.connect(str(db_path), timeout=30, isolation_level=None)
+    cur = await conn.execute("SELECT from_id, to_id, minutes FROM times")
+    rows = await cur.fetchall()
+    await cur.close()
+    await conn.close()
+
+    for a, b, mins in rows:
+        ca, cb = canonical_pair(a, b)
+        time_map[(ca, cb)] = mins
+        time_map[(cb, ca)] = mins
+        if ca != cb and mins == 0:
+            uf.union(ca, cb)
+    return time_map, uf
+
+
 async def compute_times(
     crawler: MetroCrawler,
     stations: List[Station],
@@ -407,7 +432,8 @@ def write_average_ranking(
             if uf.find(sid_a) == uf.find(sid_b):
                 continue
             minutes = time_map.get((sid_a, sid_b))
-            if isinstance(minutes, int):
+            # only include positive integer travel times; skip None and zeros
+            if isinstance(minutes, int) and minutes > 0:
                 values.append(minutes)
 
         average = sum(values) / len(values) if values else float("nan")
@@ -440,6 +466,11 @@ def parse_args() -> argparse.Namespace:
         default=16,
         help="Number of worker threads for fetching pair times",
     )
+    parser.add_argument(
+        "--compute-only",
+        action="store_true",
+        help="Skip network crawling; compute outputs only using existing station files and database",
+    )
     return parser.parse_args()
 
 
@@ -455,14 +486,21 @@ async def main() -> None:
         stations_csv_path = output_dir / "stations_all.csv"
         stations_md_path = output_dir / "stations_by_line.md"
 
-        if stations_csv_path.exists() and stations_md_path.exists():
-            print("Station files found; skip station crawling and load from cache")
+        if args.compute_only:
+            if not (stations_csv_path.exists() and stations_md_path.exists() and db_path.exists()):
+                raise RuntimeError("compute-only requested but cache files missing")
+            print("compute-only: loading from cache")
             stations, per_line = load_station_catalog_from_csv(stations_csv_path)
+            time_map, uf = await load_time_map_and_uf(db_path, stations)
         else:
-            stations, per_line = await build_station_catalog(crawler)
-            write_stations_human_readable(per_line, output_dir)
+            if stations_csv_path.exists() and stations_md_path.exists():
+                print("Station files found; skip station crawling and load from cache")
+                stations, per_line = load_station_catalog_from_csv(stations_csv_path)
+            else:
+                stations, per_line = await build_station_catalog(crawler)
+                write_stations_human_readable(per_line, output_dir)
 
-        time_map, uf = await compute_times(crawler, stations, db_path, workers=args.workers)
+            time_map, uf = await compute_times(crawler, stations, db_path, workers=args.workers)
 
         write_time_matrix(stations, time_map, output_dir)
         write_average_ranking(stations, time_map, uf, output_dir)

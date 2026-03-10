@@ -1,6 +1,6 @@
 # Shanghai Metro Accessibility Crawler
 
-This script fetches station data from Shanghai Metro official mobile endpoints, computes pairwise travel time costs, and outputs station ranking by average travel time.
+This script uses asynchronous HTTP requests to fetch station data from Shanghai Metro mobile endpoints, computes pairwise travel-time costs, stores results in a WAL‑mode SQLite database, and produces human-readable and CSV outputs including an average travel-time ranking.
 
 ## What it does
 
@@ -8,7 +8,7 @@ This script fetches station data from Shanghai Metro official mobile endpoints, 
    - `1..18`
    - `41` (浦江线)
    - `51` (市域机场线)
-2. Writes human-readable station lists.
+2. Writes or loads human-readable station lists cached in CSV/Markdown.
 3. Queries travel time between station pairs using:
    - `func=plantrip`
    - `impedancevalue` as travel-time minutes.
@@ -18,20 +18,22 @@ This script fetches station data from Shanghai Metro official mobile endpoints, 
 5. Treats empty `pathList` as same physical station and assigns `0`.
 6. Computes average travel time per station to all **other non-equivalent** stations.
 7. If `output/stations_all.csv` and `output/stations_by_line.md` already exist, station crawling is skipped and station data is loaded from disk.
-8. Shows pair-crawling progress with ETA using `tqdm`.
+8. Shows pair-crawling progress with ETA using `tqdm`. The crawler retries failed requests and can recover from partial data stored in the database.
 
 ## Run
 
 ```bash
-python3 shmetro_accessibility.py --output output
+python3 shmetro_accessibility.py --output output        # default crawling mode
+python3 shmetro_accessibility.py --output output --compute-only  # use existing cache, skip network
 ```
 
 Optional flags:
 
-- `--workers 16` number of parallel worker threads used when collecting pairwise times (default 16).
+- `--workers 16` number of parallel tasks used when collecting pairwise times (default 16).
 - `--pause 0.15` pause seconds between requests.
 - `--timeout 15` HTTP timeout.
 - `--retries 3` request retry count.
+- `--compute-only` skip network crawling and regenerate outputs from cache (requires existing station files and database).
 
 Progress display:
 
