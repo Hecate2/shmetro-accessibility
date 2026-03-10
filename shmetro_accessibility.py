@@ -18,9 +18,12 @@ import aiosqlite
 import httpx
 from tqdm import tqdm
 
-AMAP_POI_URL = "https://restapi.amap.com/v3/place/text"
+AMAP_POI_URL = "https://restapi.amap.com/v5/place/text"
 AMAP_TRANSIT_URL = "https://restapi.amap.com/v5/direction/transit/integrated"
 SHANGHAI_CITY_CODE = "021"
+SHANGHAI_ADCODE = "310000"
+SUZHOU_ADCODE = "320500"
+SUZHOU_LINE11_STATIONS = {"花桥", "光明路", "兆丰路"}
 RETRIABLE_INFOS = {
     "CUQPS_HAS_EXCEEDED_THE_LIMIT",
     "DAILY_QUERY_OVER_LIMIT",
@@ -31,6 +34,8 @@ LINE_LABELS = {
     41: "浦江线",
     51: "市域机场线",
 }
+POI_TYPE_STATION = "交通设施服务;地铁站;地铁站"
+POI_TYPE_EXIT = "交通设施服务;地铁站;出入口"
 
 
 @dataclass(frozen=True)
@@ -193,12 +198,25 @@ def load_station_catalog_from_csv(csv_path: Path) -> List[Station]:
 
 
 def choose_station_queries(station: Station) -> List[str]:
-    return [
+    queries = [
+        f"{station.station_name} 上海 {station.line_label} 地铁站",
+        f"上海 {station.station_name} {station.line_label} 地铁站",
         f"{station.station_name} {station.line_label} 地铁站",
-        f"{station.station_name}地铁站 {station.line_label}",
-        f"{station.station_name} {station.line_label}",
-        f"{station.station_name} 地铁站",
+        f"{station.line_label} {station.station_name} 上海 地铁站",
+        f"上海地铁 {station.line_label} {station.station_name}",
     ]
+    deduped_queries: List[str] = []
+    for query in queries:
+        if query not in deduped_queries:
+            deduped_queries.append(query)
+    return deduped_queries
+
+
+def choose_station_regions(station: Station) -> List[str]:
+    regions = [SHANGHAI_ADCODE]
+    if station.line == 11 and station.station_name in SUZHOU_LINE11_STATIONS:
+        regions.append(SUZHOU_ADCODE)
+    return regions
 
 
 def candidate_score(station: Station, poi: Dict[str, Any]) -> Tuple[int, str]:
@@ -225,19 +243,11 @@ def candidate_score(station: Station, poi: Dict[str, Any]) -> Tuple[int, str]:
         score += 35
         reasons.append("line")
 
-    if "交通设施服务;地铁站;出入口" in poi_type:
-        score += 45
-        reasons.append("exit")
-    elif "交通设施服务;地铁站;地铁站" in poi_type:
-        score += 30
+    if poi_type == POI_TYPE_STATION:
+        score += 50
         reasons.append("station")
-    elif "地铁站" in poi_type:
-        score += 15
-        reasons.append("subway-type")
-
-    if "出入口" in name:
-        score += 10
-        reasons.append("exit-name")
+    else:
+        return -1, "unsupported-poi-type"
 
     if station.line in LINE_LABELS and line_norm not in f"{name_norm}{address_norm}":
         score -= 10
@@ -399,30 +409,42 @@ class AMapClient:
 
         raise RuntimeError(f"AMap request failed after retries: {url}; error={last_error}")
 
-    async def search_station_candidates(self, query_text: str) -> List[Dict[str, Any]]:
+    async def search_station_candidates(self, query_text: str, region: str) -> List[Dict[str, Any]]:
         credential = await self._acquire_station_search_credential()
         payload = await self._request_json(
             AMAP_POI_URL,
             {
                 "keywords": query_text,
-                "city": "上海",
-                "citylimit": "true",
-                "extensions": "all",
-                "offset": "10",
-                "page": "1",
+                "types": "150500",
+                "region": region,
+                "city_limit": "true",
+                "show_fields": "business",
+                "page_size": "10",
+                "page_num": "1",
                 "output": "JSON",
             },
             credential,
         )
         return list(payload.get("pois") or [])
 
-    async def route_transit(self, origin: str, destination: str, service_date: str, service_time: str, strategy: str) -> Dict[str, Any]:
+    async def route_transit(
+        self,
+        origin: str,
+        destination: str,
+        origin_poi: str,
+        destination_poi: str,
+        service_date: str,
+        service_time: str,
+        strategy: str,
+    ) -> Dict[str, Any]:
         credential = await self._acquire_route_plan_credential()
         return await self._request_json(
             AMAP_TRANSIT_URL,
             {
                 "origin": origin,
                 "destination": destination,
+                "originpoi": origin_poi,
+                "destinationpoi": destination_poi,
                 "city1": SHANGHAI_CITY_CODE,
                 "city2": SHANGHAI_CITY_CODE,
                 "strategy": strategy,
@@ -436,6 +458,12 @@ class AMapClient:
             },
             credential,
         )
+
+
+def resolved_station_can_plan_route(resolved_station: Optional[ResolvedStation]) -> bool:
+    if resolved_station is None:
+        return False
+    return bool(resolved_station.location and resolved_station.poi_id and resolved_station.poi_type == POI_TYPE_STATION)
 
 
 async def init_db(db_path: Path) -> aiosqlite.Connection:
@@ -509,53 +537,43 @@ async def load_route_results(conn: aiosqlite.Connection) -> Dict[Tuple[str, str]
 
 async def resolve_station_node(client: AMapClient, station: Station) -> ResolvedStation:
     best_record: Optional[ResolvedStation] = None
-    for query_text in choose_station_queries(station):
-        candidates = await client.search_station_candidates(query_text)
-        for poi in candidates:
-            score, note = candidate_score(station, poi)
-            if score < 0:
-                continue
-            location = str(poi.get("location") or "")
-            if not location:
-                continue
-            record = ResolvedStation(
-                station_id=station.station_id,
-                station_name=station.station_name,
-                line=station.line,
-                line_label=station.line_label,
-                query_text=query_text,
-                poi_id=str(poi.get("id") or ""),
-                poi_name=str(poi.get("name") or ""),
-                poi_type=str(poi.get("type") or ""),
-                poi_address=str(poi.get("address") or ""),
-                location=location,
-                status="resolved" if score >= 110 else "fallback",
-                score=score,
-                note=note,
-            )
-            if best_record is None or record.score > best_record.score:
-                best_record = record
-        if best_record is not None and best_record.score >= 110:
-            return best_record
+    for region in choose_station_regions(station):
+        for query_text in choose_station_queries(station):
+            candidates = await client.search_station_candidates(query_text, region)
+            for poi in candidates:
+                poi_type = str(poi.get("type") or "")
+                if poi_type != POI_TYPE_STATION:
+                    continue
+                score, note = candidate_score(station, poi)
+                if score < 0:
+                    continue
+                location = str(poi.get("location") or "")
+                poi_id = str(poi.get("id") or "")
+                if not location or not poi_id:
+                    continue
+                record = ResolvedStation(
+                    station_id=station.station_id,
+                    station_name=station.station_name,
+                    line=station.line,
+                    line_label=station.line_label,
+                    query_text=f"{query_text} [region={region}]",
+                    poi_id=poi_id,
+                    poi_name=str(poi.get("name") or ""),
+                    poi_type=poi_type,
+                    poi_address=str(poi.get("address") or ""),
+                    location=location,
+                    status="resolved",
+                    score=score,
+                    note=note,
+                )
+                if best_record is None or record.score > best_record.score:
+                    best_record = record
+            if best_record is not None and best_record.score >= 110:
+                return best_record
 
     if best_record is not None:
         return best_record
-
-    return ResolvedStation(
-        station_id=station.station_id,
-        station_name=station.station_name,
-        line=station.line,
-        line_label=station.line_label,
-        query_text=choose_station_queries(station)[0],
-        poi_id="",
-        poi_name="",
-        poi_type="",
-        poi_address="",
-        location="",
-        status="unresolved",
-        score=0,
-        note="no_candidate",
-    )
+    raise RuntimeError(f"No subway-station POI found for {station.line_label} {station.station_name}")
 
 
 async def resolve_stations(
@@ -654,7 +672,11 @@ async def crawl_routes(
     strategy: str,
 ) -> Dict[Tuple[str, str], RouteResult]:
     existing = await load_route_results(conn)
-    resolved_ids = {station_id for station_id, record in resolved_stations.items() if record.location}
+    resolved_ids = {
+        station_id
+        for station_id, record in resolved_stations.items()
+        if resolved_station_can_plan_route(record)
+    }
 
     pairs: List[Tuple[Station, Station]] = []
     for origin in stations:
@@ -688,9 +710,13 @@ async def crawl_routes(
 
     async def fetch_one(pair: Tuple[Station, Station]) -> RouteResult:
         origin, destination = pair
+        origin_resolved = resolved_stations[origin.station_id]
+        destination_resolved = resolved_stations[destination.station_id]
         payload = await client.route_transit(
-            origin=resolved_stations[origin.station_id].location,
-            destination=resolved_stations[destination.station_id].location,
+            origin=origin_resolved.location,
+            destination=destination_resolved.location,
+            origin_poi=origin_resolved.poi_id,
+            destination_poi=destination_resolved.poi_id,
             service_date=service_date,
             service_time=service_time,
             strategy=strategy,
