@@ -1,6 +1,6 @@
 # Shanghai Metro Accessibility Crawler
 
-This script now uses AMap Web Service APIs to estimate directed travel time from every Shanghai metro station node to every other station node around a weekday morning departure time.
+This script now uses AMap (高德地图) Web Service APIs to estimate directed travel time from every Shanghai metro station node to every other station node around a weekday morning departure time.
 
 ## What Changed
 
@@ -16,7 +16,7 @@ This script now uses AMap Web Service APIs to estimate directed travel time from
 
 ## Prerequisites
 
-- You need an AMap Web Service key.
+- You need an AMap Web Service key. Create a key at https://console.amap.com/dev/key/app with `服务平台`=`Web服务`. In `设置` for the key, turn on `数字签名`. Paste the `私钥` as `SEC` in `.env` file.
 - The AMap account should complete personal developer verification before using the crawler.
 
 ## Inputs
