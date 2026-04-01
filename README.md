@@ -38,6 +38,10 @@ This script now uses AMap (高德地图) Web Service APIs to estimate directed t
     away since only the `stations_all.csv` output is needed.)
     The new AMap-based workflow assumes the same format and will read
     whatever catalog you feed it.
+  - After the first successful sync, the station catalog is also stored
+    in `output/amap_transit.db`. If `--stations-csv` points to a missing
+    file, `shmetro_accessibility.py` will fall back to the catalog already
+    stored in SQLite.
 - `.env`
   - You can use a single credential pair:
 
@@ -85,8 +89,8 @@ Important flags:
 - `--compute-only` skips network calls and rebuilds outputs from the SQLite cache.
 - `--route-workers` controls concurrent route requests.
 - `--resolve-workers` controls concurrent station matching requests.
-- `--station-search-qps` hard-caps station search requests per credential and defaults to `3.1` QPS.
-- `--route-plan-qps` hard-caps route planning requests per credential and defaults to `3.1` QPS.
+- `--station-search-qps` hard-caps station search requests per credential and defaults to `3.01` QPS.
+- `--route-plan-qps` hard-caps route planning requests per credential and defaults to `3.01` QPS.
 - `--pause` adds an optional extra delay after successful AMap calls and defaults to `0`.
 - `--strategy 7` uses AMap metro-priority public transit mode by default.
 
@@ -97,7 +101,8 @@ Default database: `output/amap_transit.db`
 Tables:
 
 - `station_amap`
-  - Stores the matched AMap POI or exit for each line-specific station node.
+  - Stores both the line-specific station catalog and the matched AMap POI
+    metadata for each station node.
 - `route_times`
   - Stores directed route results from `from_id -> to_id`.
   - `status='done'` means a valid public-transit route was found.
@@ -117,7 +122,7 @@ Tables:
 ## Notes
 
 - The route matrix is directional because entrances, walking time, and service patterns can differ by direction.
-- Each credential pair has an independent `3.1` QPS cap for station search and route planning by default.
+- Each credential pair has an independent `3.01` QPS cap for station search and route planning by default.
 - When multiple credential pairs are configured, the crawler rotates across them to raise aggregate throughput while keeping each pair inside its own cap.
 - AMap can still rate-limit requests, so modest concurrency is safer for long runs.
 - If some station nodes remain unresolved, their routes will be left blank in the outputs until a later rerun resolves them.

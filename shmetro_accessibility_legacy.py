@@ -361,7 +361,7 @@ async def compute_times(
 
 def save_checkpoint(time_map: Dict[Tuple[str, str], Optional[int]], checkpoint_path: Path) -> None:
     rows = [{"from": key[0], "to": key[1], "minutes": value} for key, value in time_map.items()]
-    checkpoint_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    checkpoint_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8-sig")
 
 
 def write_stations_human_readable(per_line: Dict[int, List[Station]], output_dir: Path) -> None:
@@ -378,9 +378,9 @@ def write_stations_human_readable(per_line: Dict[int, List[Station]], output_dir
             for station in stations:
                 lines.append(f"- {station.station_name} ({station.station_id})")
         lines.append("")
-    md_path.write_text("\n".join(lines), encoding="utf-8")
+    md_path.write_text("\n".join(lines), encoding="utf-8-sig")
 
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(["line", "station_id", "station_name"])
         for line_no in LINE_NUMBERS:
@@ -395,7 +395,7 @@ def write_time_matrix(stations: List[Station], time_map: Dict[Tuple[str, str], O
     station_ids = [station.station_id for station in stations]
     id_to_name = {station.station_id: station.station_name for station in stations}
 
-    with matrix_csv.open("w", newline="", encoding="utf-8") as f:
+    with matrix_csv.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(["from_id", "from_name", "to_id", "to_name", "minutes"])
         for sid_a in station_ids:
@@ -407,7 +407,7 @@ def write_time_matrix(stations: List[Station], time_map: Dict[Tuple[str, str], O
         for sid_b in station_ids[i + 1 :]:
             minutes = time_map.get((sid_a, sid_b))
             md_lines.append(f"| {id_to_name[sid_a]} ({sid_a}) | {id_to_name[sid_b]} ({sid_b}) | {minutes} |")
-    readable_md.write_text("\n".join(md_lines), encoding="utf-8")
+    readable_md.write_text("\n".join(md_lines), encoding="utf-8-sig")
 
 
 def write_average_ranking(
@@ -441,7 +441,7 @@ def write_average_ranking(
 
     ranking.sort(key=lambda item: (float("inf") if item[2] != item[2] else item[2], item[0]))
 
-    with ranking_csv.open("w", newline="", encoding="utf-8") as f:
+    with ranking_csv.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(["rank", "station_id", "station_name", "average_minutes", "sample_size"])
         for idx, (sid, name, avg, sample_size) in enumerate(ranking, start=1):
@@ -451,7 +451,7 @@ def write_average_ranking(
     for idx, (sid, name, avg, sample_size) in enumerate(ranking, start=1):
         avg_text = f"{avg:.4f}" if avg == avg else "NaN"
         lines.append(f"| {idx} | {name} ({sid}) | {avg_text} | {sample_size} |")
-    ranking_md.write_text("\n".join(lines), encoding="utf-8")
+    ranking_md.write_text("\n".join(lines), encoding="utf-8-sig")
 
 
 def parse_args() -> argparse.Namespace:
