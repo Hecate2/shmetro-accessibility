@@ -137,3 +137,28 @@ By default `shmetro_accessibility.py` queries travel time durations using a **we
 2. **Filter results later.** After crawling, drop or flag any rows whose date corresponds to a holiday according to your own calendar.
 
 Keeping these caveats in mind will help avoid misleading travel‑time estimates during atypical service periods.
+
+## Shenzhen Variant
+
+The repository now also includes `szmetro_accessibility.py` for Shenzhen. List of metro stations come from https://www.metroman.cc
+
+Run it like this:
+
+```bash
+python3 szmetro_accessibility.py
+python3 szmetro_accessibility.py --resolve-only
+python3 szmetro_accessibility.py --compute-only
+python3 szmetro_accessibility.py --db-path output/shenzhen/amap_transit.db
+```
+
+Default Shenzhen outputs:
+
+- `output/shenzhen/stations_all.csv`
+- `output/shenzhen/stations_by_line.md`
+- `output/shenzhen/amap_station_matches.csv`
+- `output/shenzhen/amap_station_matches.md`
+- `output/shenzhen/amap_transit.db`
+- `output/shenzhen/travel_time_matrix.csv`
+- `output/shenzhen/travel_time_pairs.md`
+- `output/shenzhen/average_time_ranking.csv`
+- `output/shenzhen/average_time_ranking.md`
