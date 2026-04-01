@@ -396,6 +396,19 @@ async def load_resolved_stations(conn: aiosqlite.Connection) -> Dict[str, Resolv
     return resolved
 
 
+async def load_station_catalog_from_db(conn: aiosqlite.Connection) -> List[Station]:
+    cursor = await conn.execute(
+        "SELECT station_id, station_slug, station_name, line_order, line_label, source_key FROM station_amap ORDER BY line_order, station_id"
+    )
+    rows = await cursor.fetchall()
+    await cursor.close()
+
+    stations = [Station(*row) for row in rows]
+    if not stations:
+        raise RuntimeError("Station HTML not found and station_amap is empty. Provide --stations-html or populate the database first.")
+    return stations
+
+
 async def load_route_results(conn: aiosqlite.Connection) -> Dict[Tuple[str, str], RouteResult]:
     cursor = await conn.execute(
         "SELECT from_id, to_id, status, duration_seconds, transit_index, summary, reason FROM route_times"
@@ -958,19 +971,21 @@ async def main() -> None:
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    stations_html = Path(args.stations_html)
-    if not stations_html.exists():
-        raise RuntimeError(f"Station HTML not found: {stations_html}")
-
-    stations = load_station_catalog_from_html(stations_html)
-    write_station_catalog(stations, output_dir)
-
     db_path = Path(args.db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = await init_db(db_path)
 
     client: Optional[ShenzhenAMapClient] = None
     try:
+        stations_html = Path(args.stations_html)
+        if stations_html.exists():
+            stations = load_station_catalog_from_html(stations_html)
+        else:
+            stations = await load_station_catalog_from_db(conn)
+            print(f"Station HTML not found: {stations_html}. Loaded {len(stations)} stations from {db_path}.")
+
+        write_station_catalog(stations, output_dir)
+
         resolved = await load_resolved_stations(conn)
         routes = await load_route_results(conn)
 
