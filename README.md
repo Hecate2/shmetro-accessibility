@@ -89,6 +89,7 @@ Important flags:
 - `--compute-only` skips network calls and rebuilds outputs from the SQLite cache.
 - `--route-workers` controls concurrent route requests.
 - `--resolve-workers` controls concurrent station matching requests.
+- `--max-routes` optionally limits how many unresolved routes are crawled in one run. Use this for small smoke tests before a full crawl.
 - `--station-search-qps` hard-caps station search requests per credential and defaults to `3.01` QPS.
 - `--route-plan-qps` hard-caps route planning requests per credential and defaults to `3.01` QPS.
 - `--pause` adds an optional extra delay after successful AMap calls and defaults to `0`.
@@ -167,3 +168,28 @@ Default Shenzhen outputs:
 - `output/shenzhen/travel_time_pairs.md`
 - `output/shenzhen/average_time_ranking.csv`
 - `output/shenzhen/average_time_ranking.md`
+
+## Wuhan Variant
+
+The repository now also includes `whmetro_accessibility.py` for Wuhan. The station list comes from `武汉地铁车站列表 - 地铁通 MetroMan.html`.
+
+Run it like this:
+
+```bash
+python3 whmetro_accessibility.py
+python3 whmetro_accessibility.py --resolve-only
+python3 whmetro_accessibility.py --max-routes 80
+python3 whmetro_accessibility.py --db-path output/wuhan/amap_transit.db
+```
+
+Default Wuhan outputs:
+
+- `output/wuhan/stations_all.csv`
+- `output/wuhan/stations_by_line.md`
+- `output/wuhan/amap_station_matches.csv`
+- `output/wuhan/amap_station_matches.md`
+- `output/wuhan/amap_transit.db`
+- `output/wuhan/travel_time_matrix.csv`
+- `output/wuhan/travel_time_pairs.md`
+- `output/wuhan/average_time_ranking.csv`
+- `output/wuhan/average_time_ranking.md`

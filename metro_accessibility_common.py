@@ -161,6 +161,12 @@ def build_standard_parser(
     parser.add_argument("--retries", type=int, default=4, help="Retry count for transient AMap errors")
     parser.add_argument("--resolve-workers", type=int, default=2, help="Concurrent workers for station matching")
     parser.add_argument("--route-workers", type=int, default=6, help="Concurrent workers for route crawling")
+    parser.add_argument(
+        "--max-routes",
+        type=int,
+        default=0,
+        help="Optional cap for how many unresolved routes to crawl in this run; 0 means no cap",
+    )
     parser.add_argument("--station-search-qps", type=float, default=3.01, help="Hard QPS cap for AMap station search requests")
     parser.add_argument("--route-plan-qps", type=float, default=3.01, help="Hard QPS cap for AMap route planning requests")
     parser.add_argument("--date", default=default_service_date_value, help="Service date in YYYY-MM-DD, defaults to a workday")
@@ -737,6 +743,7 @@ async def crawl_routes(
     service_time: str,
     strategy: str,
     route_city_code: Callable[[Station], str],
+    max_routes: Optional[int] = None,
 ) -> Dict[Tuple[str, str], RouteResult]:
     existing = await load_route_results(conn)
     resolved_ids = {
@@ -756,6 +763,9 @@ async def crawl_routes(
             if route_result_is_final(current):
                 continue
             pairs.append((origin, destination))
+
+    if max_routes is not None and max_routes > 0:
+        pairs = pairs[:max_routes]
 
     completed = 0
     for origin in stations:
