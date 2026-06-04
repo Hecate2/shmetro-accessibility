@@ -258,6 +258,21 @@ async def main() -> None:
             resolved = await resolve_stations(client, conn, stations, workers=args.resolve_workers, rules=RESOLVE_RULES)
             write_station_resolution(stations, resolved, output_dir)
 
+            if not args.resolve_only:
+                max_routes = args.max_routes if args.max_routes > 0 else None
+                routes = await crawl_routes(
+                    client=client,
+                    conn=conn,
+                    stations=stations,
+                    resolved_stations=resolved,
+                    workers=args.route_workers,
+                    service_date=args.date,
+                    service_time=args.time,
+                    strategy=args.strategy,
+                    route_city_code=RESOLVE_RULES.route_city_code,
+                    max_routes=max_routes,
+                )
+
         write_station_catalog(stations, output_dir, "Guangzhou")
         write_station_resolution(stations, resolved, output_dir)
         write_route_outputs(stations, routes, output_dir, "Guangzhou")
