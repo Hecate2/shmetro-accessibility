@@ -222,7 +222,14 @@ class AMapClient:
         self.pause_sec = pause_sec
         self.timeout_sec = timeout_sec
         self.retries = retries
-        self.client = httpx.AsyncClient(timeout=self.timeout_sec)
+        transport = httpx.AsyncHTTPTransport(
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=30.0,
+            ),
+        )
+        self.client = httpx.AsyncClient(timeout=self.timeout_sec, transport=transport)
         self.credentials = [
             AMapCredentialRuntime(
                 key=credential.key,
