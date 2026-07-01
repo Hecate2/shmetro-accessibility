@@ -15,11 +15,14 @@ import aiosqlite
 from tqdm import tqdm
 
 from amap_accessibility_common import (
+    AMAP_GEOCODE_URL,
     AMAP_POI_URL,
     AMAP_TRANSIT_URL,
     AMapClient,
     AMapCredentialConfig,
     RouteResult,
+    load_amap_credentials,
+    load_env_file,
     route_result_is_final,
     select_transit,
 )
@@ -72,6 +75,7 @@ class StationResolveRules:
     candidate_score: Callable[[Station, Dict[str, Any]], Tuple[int, str]]
     route_city_code: Callable[[Station], str]
     accepted_score: int = 110
+    fallback_resolver: Optional[Callable[["MetroAMapClient", Station], Awaitable[Optional[ResolvedStation]]]] = None
 
 
 STATION_AMAP_COLUMNS = (
@@ -169,6 +173,7 @@ def build_standard_parser(
     )
     parser.add_argument("--station-search-qps", type=float, default=3.01, help="Hard QPS cap for AMap station search requests")
     parser.add_argument("--route-plan-qps", type=float, default=3.01, help="Hard QPS cap for AMap route planning requests")
+    parser.add_argument("--search-page-size", type=int, default=25, help="Page size for AMap POI search (1-25)")
     parser.add_argument("--date", default=default_service_date_value, help="Service date in YYYY-MM-DD, defaults to a workday")
     parser.add_argument("--time", default="7:15", help="Departure time, for example 7:15")
     parser.add_argument("--strategy", default="0", help="AMap transit strategy, default 0 is the auto-recommended route")
@@ -209,6 +214,184 @@ def station_name_variants(station_name: str) -> List[str]:
     if stripped_name and stripped_name not in variants:
         variants.append(stripped_name)
     return variants
+
+
+def make_poi_type_score(
+    special_rail_predicate: Callable[[Station], bool] = lambda _: False,
+    special_rail_poi_keywords: Sequence[str] = (),
+    metro_score: int = 50,
+    special_rail_score: int = 35,
+) -> Callable[[Station, str], Optional[Tuple[int, str]]]:
+    all_keywords = tuple(special_rail_poi_keywords) + ("电车站",)
+
+    def poi_type_score(station: Station, poi_type: str) -> Optional[Tuple[int, str]]:
+        if poi_type == POI_TYPE_STATION:
+            return metro_score, "metro-station"
+        if special_rail_predicate(station) and any(keyword in poi_type for keyword in all_keywords):
+            return special_rail_score, "special-rail"
+        return None
+
+    return poi_type_score
+
+
+def build_city_candidate_score(
+    station: Station,
+    poi: Dict[str, Any],
+    *,
+    station_name_variants_fn: Callable[[str], List[str]],
+    city_names: Sequence[str],
+    city_adcodes: Sequence[str],
+    poi_type_score_fn: Callable[[Station, str], Optional[Tuple[int, str]]],
+    special_rail_predicate: Callable[[Station], bool] = lambda _: False,
+    special_rail_bonus_keywords: Sequence[str] = (),
+    special_rail_bonus: int = 15,
+    city_reason: str = "city-match",
+) -> Tuple[int, str]:
+    name = str(poi.get("name") or "")
+    address = str(poi.get("address") or "")
+    poi_type = str(poi.get("type") or "")
+    city_name = str(poi.get("cityname") or "")
+    district_name = str(poi.get("adname") or "")
+    adcode = str(poi.get("adcode") or "")
+
+    station_name_norms = [normalize_text(value) for value in station_name_variants_fn(station.station_name)]
+    line_norm = normalize_text(station.line_label)
+    name_norm = normalize_text(name)
+    address_norm = normalize_text(address)
+    combined_norm = normalize_text(f"{name} {address} {city_name} {district_name}")
+
+    score = 0
+    reasons: List[str] = []
+
+    matched_station_norm = next(
+        (
+            station_norm
+            for station_norm in station_name_norms
+            if station_norm and (station_norm == name_norm or station_norm in name_norm)
+        ),
+        None,
+    )
+    if matched_station_norm is not None:
+        score += 60
+        reasons.append("name")
+        if name_norm in {matched_station_norm, f"{matched_station_norm}站"}:
+            score += 15
+            reasons.append("exact-name")
+    elif any(station_norm and station_norm in address_norm for station_norm in station_name_norms):
+        score += 30
+        reasons.append("address")
+    else:
+        return -1, "station-name-mismatch"
+
+    if line_norm and line_norm in combined_norm:
+        score += 35
+        reasons.append("line")
+
+    if adcode in city_adcodes or any(city in f"{city_name}{district_name}{address}" for city in city_names):
+        score += 10
+        reasons.append(city_reason)
+
+    type_result = poi_type_score_fn(station, poi_type)
+    if type_result is None:
+        return -1, "unsupported-poi-type"
+
+    score += type_result[0]
+    reasons.append(type_result[1])
+
+    if special_rail_predicate(station) and any(keyword in f"{name}{address}{poi_type}" for keyword in special_rail_bonus_keywords):
+        score += special_rail_bonus
+        reasons.append("special-rail-keyword")
+
+    return score, ",".join(reasons)
+
+
+def build_standard_metro_queries(station_name: str, city_name: str, line_label: str) -> List[str]:
+    return [
+        f"{station_name} {city_name} {line_label} 地铁站",
+        f"{city_name} {station_name} {line_label} 地铁站",
+        f"{station_name} {line_label} 地铁站",
+        f"{station_name} {city_name} {line_label} 站",
+        f"{city_name}地铁 {line_label} {station_name}",
+        f"{station_name} {city_name} 地铁站",
+    ]
+
+
+def build_simplified_line_queries(station_name: str, city_name: str, simplified_line_label: str) -> List[str]:
+    return [
+        f"{station_name} {city_name} {simplified_line_label} 站",
+        f"{city_name} {station_name} {simplified_line_label} 站",
+        f"{station_name} {city_name} {simplified_line_label} 电车站",
+    ]
+
+
+def expand_station_name_variants(
+    station_name: str,
+    *,
+    strip_city_names: Sequence[str] = (),
+) -> List[str]:
+    """在 station_name_variants 基础上额外剔除城市前缀和末尾的“站”字。"""
+    variants = list(station_name_variants(station_name))
+
+    for city_name in strip_city_names:
+        if city_name and city_name in station_name:
+            stripped = station_name.replace(city_name, "")
+            if stripped and stripped not in variants:
+                variants.append(stripped)
+
+    if "站" in station_name:
+        no_station = station_name.replace("站", "")
+        if no_station and no_station not in variants:
+            variants.append(no_station)
+
+    return dedupe_strings(variants)
+
+
+def build_common_special_rail_queries(station_name: str, city_name: str, line_label: str) -> List[str]:
+    """适用于多数城市有轨电车/云巴/轻轨等特殊轨道交通的查询模板。"""
+    return [
+        f"{station_name} {city_name} {line_label} 站",
+        f"{city_name} {station_name} {line_label} 站",
+        f"{station_name} {city_name} 有轨电车站",
+        f"{city_name}有轨电车 {station_name}",
+        f"{station_name} {city_name} 轨道站",
+        f"{station_name} 有轨电车",
+        f"{station_name} 电车站",
+        f"{city_name} {station_name} 电车站",
+        f"{station_name} {city_name} 车站",
+        f"{station_name} (有轨电车站)",
+    ]
+
+
+def build_station_queries_with_simplified_lines(
+    station: Station,
+    *,
+    city_names: Sequence[str],
+    station_uses_special_rail: Callable[[Station], bool],
+    expand_variants_fn: Callable[[str], List[str]],
+    line_label_simplifiers: Sequence[Tuple[str, str]] = (),
+    special_rail_queries_fn: Callable[[str, str, str], List[str]] = build_common_special_rail_queries,
+) -> List[str]:
+    """按常见模式组装车站查询词：基础查询 + 特殊轨道交通查询 + 简化线路名查询。"""
+    queries: List[str] = []
+    all_station_names = expand_variants_fn(station.station_name)
+
+    for station_name in all_station_names:
+        for city_name in city_names:
+            if station_uses_special_rail(station):
+                queries.extend(special_rail_queries_fn(station_name, city_name, station.line_label))
+            queries.extend(build_standard_metro_queries(station_name, city_name, station.line_label))
+
+    simplified_line_label = station.line_label
+    for old, new in line_label_simplifiers:
+        simplified_line_label = simplified_line_label.replace(old, new)
+    simplified_line_label = simplified_line_label.strip()
+
+    if simplified_line_label and simplified_line_label != station.line_label:
+        for station_name in all_station_names:
+            for city_name in city_names:
+                queries.extend(build_simplified_line_queries(station_name, city_name, simplified_line_label))
+
+    return dedupe_strings(queries)
 
 
 class MetroManStationHTMLParser(HTMLParser):
@@ -654,6 +837,11 @@ async def resolve_station_node(
 
     if best_record is not None:
         return best_record
+
+    if rules.fallback_resolver is not None:
+        fallback_record = await rules.fallback_resolver(client, station)
+        if fallback_record is not None:
+            return fallback_record
 
     raise RuntimeError(f"No station POI found for {station.line_label} {station.station_name}")
 
@@ -1118,3 +1306,72 @@ def write_average_ranking(stations: Sequence[Station], routes: Dict[Tuple[str, s
         avg_text = f"{average_minutes:.4f}" if not math.isnan(average_minutes) else "NaN"
         lines.append(f"| {index} | {line_label} {station_name} ({station_id}) | {avg_text} | {sample_size} |")
     ranking_md.write_text("\n".join(lines), encoding="utf-8-sig")
+
+
+async def run_city_accessibility_main(
+    args: argparse.Namespace,
+    rules: StationResolveRules,
+    network_name: str,
+) -> None:
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    db_path = Path(args.db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = await init_db(db_path)
+
+    client: Optional[MetroAMapClient] = None
+    try:
+        stations_html = Path(args.stations_html)
+        catalog = await load_or_sync_station_catalog(conn, stations_html)
+        stations = catalog.stations
+        if catalog.source != "html":
+            print(f"Station HTML not found: {stations_html}. Loaded {len(stations)} stations from {catalog.source} in {db_path}.")
+
+        write_station_catalog(stations, output_dir, network_name)
+
+        resolved = await load_resolved_stations(conn)
+        routes = await load_route_results(conn)
+
+        if not args.compute_only:
+            env_values = load_env_file(Path(args.env_file))
+            credentials = load_amap_credentials(env_values)
+            client = MetroAMapClient(
+                credentials=credentials,
+                pause_sec=args.pause,
+                timeout_sec=args.timeout,
+                retries=args.retries,
+                station_search_qps=args.station_search_qps,
+                route_plan_qps=args.route_plan_qps,
+                search_page_size=args.search_page_size,
+            )
+
+            resolved = await resolve_stations(client, conn, stations, workers=args.resolve_workers, rules=rules)
+            write_station_resolution(stations, resolved, output_dir)
+
+            if not args.resolve_only:
+                max_routes = args.max_routes if args.max_routes > 0 else None
+                routes = await crawl_routes(
+                    client=client,
+                    conn=conn,
+                    stations=stations,
+                    resolved_stations=resolved,
+                    workers=args.route_workers,
+                    service_date=args.date,
+                    service_time=args.time,
+                    strategy=args.strategy,
+                    route_city_code=rules.route_city_code,
+                    max_routes=max_routes,
+                )
+
+        write_station_catalog(stations, output_dir, network_name)
+        write_station_resolution(stations, resolved, output_dir)
+        write_route_outputs(stations, routes, output_dir, network_name)
+        write_average_ranking(stations, routes, output_dir)
+    finally:
+        if client is not None:
+            await client.aclose()
+        await conn.close()
+
+    print(f"Done. Output files saved in: {output_dir.resolve()}")
+    print(f"SQLite DB: {db_path.resolve()}")

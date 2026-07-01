@@ -19,12 +19,19 @@ from metro_accessibility_common import (
     run_city_accessibility_main,
 )
 
-CHENGDU_CITY_CODE = "028"
-CHENGDU_ADCODE = "510100"
-ZIYANG_CITY_CODE = "0832"
-ZIYANG_ADCODE = "512000"
+HANGZHOU_CITY_CODE = "0571"
+HANGZHOU_ADCODE = "330100"
+SHAOXING_CITY_CODE = "0575"
+SHAOXING_ADCODE = "330600"
+NINGBO_CITY_CODE = "0574"
+NINGBO_ADCODE = "330200"
+JIAOXING_CITY_CODE = "0573"
+JIAOXING_ADCODE = "330400"
+HAITING_CITY_CODE = "0573"
+HAITING_ADCODE = "330481"
 SPECIAL_RAIL_KEYWORDS = ("空轨", "磁浮", "磁悬浮", "云巴", "轻轨", "有轨电车", "单轨")
 SPECIAL_RAIL_POI_KEYWORDS = SPECIAL_RAIL_KEYWORDS + ("电车站",)
+EXTERNAL_LINE_KEYWORDS = ("绍兴", "杭海城际")
 
 
 def station_uses_special_rail(station: Station) -> bool:
@@ -32,32 +39,33 @@ def station_uses_special_rail(station: Station) -> bool:
     return any(keyword in combined for keyword in SPECIAL_RAIL_KEYWORDS)
 
 
-def station_uses_ziyang_context(station: Station) -> bool:
-    return station.line_label.startswith("S3") or "资阳" in station.station_name
-
-
-def station_city_names(station: Station) -> List[str]:
-    cities = ["成都"]
-    if station_uses_ziyang_context(station):
-        cities.append("资阳")
-    return cities
+def station_uses_external_context(station: Station) -> bool:
+    return any(keyword in station.line_label for keyword in EXTERNAL_LINE_KEYWORDS)
 
 
 def expand_station_name_variants(station_name: str) -> List[str]:
-    variants = list(_base_expand_station_name_variants(station_name))
+    variants = list(_base_expand_station_name_variants(station_name, strip_city_names=["杭州"]))
 
-    if "西南交大" in station_name:
-        variants.append(station_name.replace("西南交大", "交大"))
-        variants.append(station_name.replace("西南交大", "交大").replace("站", "校区"))
-        variants.append("交大" + station_name.replace("西南交大", ""))
+    if "火车东站" in station_name:
+        variants.append(station_name.replace("火车东站", "东站"))
 
-    if "犀浦站" in station_name:
-        variants.append(station_name.replace("犀浦站", "犀浦校区"))
+    if "火车南站" in station_name:
+        variants.append(station_name.replace("火车南站", "南站"))
 
-    if "站" in station_name:
-        variants.append(station_name.replace("站", "校区"))
+    if "火车西站" in station_name:
+        variants.append(station_name.replace("火车西站", "西站"))
 
     return dedupe_strings(variants)
+
+
+def station_city_names(station: Station) -> List[str]:
+    cities = ["杭州"]
+    if station_uses_external_context(station):
+        if "杭海城际" in station.line_label:
+            cities.extend(["海宁", "嘉兴"])
+        if "绍兴" in station.line_label:
+            cities.append("绍兴")
+    return cities
 
 
 def choose_station_queries(station: Station) -> List[str]:
@@ -71,9 +79,12 @@ def choose_station_queries(station: Station) -> List[str]:
 
 
 def choose_station_regions(station: Station) -> List[str]:
-    regions = [CHENGDU_ADCODE]
-    if station_uses_ziyang_context(station):
-        regions.append(ZIYANG_ADCODE)
+    regions = [HANGZHOU_ADCODE]
+    if station_uses_external_context(station):
+        if "杭海城际" in station.line_label:
+            regions.extend([HAITING_ADCODE, JIAOXING_ADCODE])
+        if "绍兴" in station.line_label:
+            regions.append(SHAOXING_ADCODE)
     return regions
 
 
@@ -102,9 +113,12 @@ def candidate_score(station: Station, poi: Dict[str, Any]) -> Tuple[int, str]:
 
 
 def station_city_code(station: Station) -> str:
-    if station_uses_ziyang_context(station):
-        return ZIYANG_CITY_CODE
-    return CHENGDU_CITY_CODE
+    if station_uses_external_context(station):
+        if "杭海城际" in station.line_label:
+            return HAITING_CITY_CODE
+        if "绍兴" in station.line_label:
+            return SHAOXING_CITY_CODE
+    return HANGZHOU_CITY_CODE
 
 
 RESOLVE_RULES = StationResolveRules(
@@ -118,17 +132,17 @@ RESOLVE_RULES = StationResolveRules(
 
 def parse_args() -> argparse.Namespace:
     return build_standard_parser(
-        description="Chengdu rail accessibility crawler backed by AMap APIs",
-        default_output="output/chengdu",
-        default_stations_html="成都地铁车站列表 - 地铁通 MetroMan.html",
-        default_db_path="output/chengdu/amap_transit.db",
+        description="Hangzhou rail accessibility crawler backed by AMap APIs",
+        default_output="output/hangzhou",
+        default_stations_html="杭州地铁车站列表 - 地铁通 MetroMan.html",
+        default_db_path="output/hangzhou/amap_transit.db",
         default_service_date_value=default_service_date(),
     ).parse_args()
 
 
 async def main() -> None:
     args = parse_args()
-    await run_city_accessibility_main(args, RESOLVE_RULES, "Chengdu")
+    await run_city_accessibility_main(args, RESOLVE_RULES, "Hangzhou")
 
 
 if __name__ == "__main__":

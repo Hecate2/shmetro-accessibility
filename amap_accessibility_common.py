@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import httpx
 
 AMAP_POI_URL = "https://restapi.amap.com/v5/place/text"
+AMAP_GEOCODE_URL = "https://restapi.amap.com/v3/geocode/geo"
 AMAP_TRANSIT_URL = "https://restapi.amap.com/v5/direction/transit/integrated"
 RETRIABLE_INFOS = {
     "CUQPS_HAS_EXCEEDED_THE_LIMIT",
@@ -246,6 +247,17 @@ class AMapClient:
 
     async def aclose(self) -> None:
         await self.client.aclose()
+
+    async def geocode(self, address: str, city: Optional[str] = None) -> List[Dict[str, Any]]:
+        credential = await self._acquire_station_search_credential()
+        params: Dict[str, Any] = {
+            "address": address,
+            "output": "JSON",
+        }
+        if city:
+            params["city"] = city
+        payload = await self._request_json(AMAP_GEOCODE_URL, params, credential)
+        return list(payload.get("geocodes") or [])
 
     def sign_params(self, params: Dict[str, Any], credential: AMapCredentialRuntime) -> str:
         raw = "&".join(f"{key}={params[key]}" for key in sorted(params)) + credential.secret
