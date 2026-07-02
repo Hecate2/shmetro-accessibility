@@ -163,8 +163,8 @@ def build_standard_parser(
     parser.add_argument("--pause", type=float, default=0.0, help="Optional extra delay after successful AMap requests")
     parser.add_argument("--timeout", type=int, default=20, help="HTTP timeout seconds")
     parser.add_argument("--retries", type=int, default=4, help="Retry count for transient AMap errors")
-    parser.add_argument("--resolve-workers", type=int, default=2, help="Concurrent workers for station matching")
-    parser.add_argument("--route-workers", type=int, default=6, help="Concurrent workers for route crawling")
+    parser.add_argument("--resolve-workers", type=int, default=16, help="Concurrent workers for station matching")
+    parser.add_argument("--route-workers", type=int, default=16, help="Concurrent workers for route crawling")
     parser.add_argument(
         "--max-routes",
         type=int,
