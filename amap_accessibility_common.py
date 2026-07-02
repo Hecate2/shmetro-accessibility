@@ -56,6 +56,15 @@ class AsyncQPSLimiter:
         self.min_interval = 1.0 / qps
         self._lock = asyncio.Lock()
         self._next_allowed_at = 0.0
+        self._usage_count = 0
+
+    @property
+    def next_available_time(self) -> float:
+        return self._next_allowed_at
+
+    @property
+    def usage_count(self) -> int:
+        return self._usage_count
 
     async def acquire(self) -> None:
         loop = asyncio.get_running_loop()
@@ -66,6 +75,7 @@ class AsyncQPSLimiter:
                 await asyncio.sleep(wait_seconds)
                 now = loop.time()
             self._next_allowed_at = now + self.min_interval
+            self._usage_count += 1
 
 
 def default_service_date() -> str:
@@ -263,17 +273,39 @@ class AMapClient:
         raw = "&".join(f"{key}={params[key]}" for key in sorted(params)) + credential.secret
         return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
+    def _select_best_credential(self, limiter_attr: str) -> AMapCredentialRuntime:
+        """选择一个凭证用于请求。
+
+        策略：优先选择当前已可用的key中使用次数最少的，保证公平性；
+        如果没有已可用的key，则选择最快可用的，减少等待时间。
+        """
+        now = asyncio.get_running_loop().time()
+        best_available: Optional[AMapCredentialRuntime] = None
+        best_available_count = float("inf")
+        best_wait: Optional[AMapCredentialRuntime] = None
+        best_wait_time = float("inf")
+
+        for credential in self.credentials:
+            limiter = getattr(credential, limiter_attr)
+            if limiter.next_available_time <= now:
+                if limiter.usage_count < best_available_count:
+                    best_available_count = limiter.usage_count
+                    best_available = credential
+            elif limiter.next_available_time < best_wait_time:
+                best_wait_time = limiter.next_available_time
+                best_wait = credential
+
+        return best_available if best_available is not None else best_wait
+
     async def _acquire_station_search_credential(self) -> AMapCredentialRuntime:
         async with self._station_search_lock:
-            credential = self.credentials[self._station_search_index]
-            self._station_search_index = (self._station_search_index + 1) % len(self.credentials)
+            credential = self._select_best_credential("station_search_limiter")
         await credential.station_search_limiter.acquire()
         return credential
 
     async def _acquire_route_plan_credential(self) -> AMapCredentialRuntime:
         async with self._route_plan_lock:
-            credential = self.credentials[self._route_plan_index]
-            self._route_plan_index = (self._route_plan_index + 1) % len(self.credentials)
+            credential = self._select_best_credential("route_plan_limiter")
         await credential.route_plan_limiter.acquire()
         return credential
 
