@@ -193,3 +193,29 @@ Default Wuhan outputs:
 - `output/wuhan/travel_time_pairs.md`
 - `output/wuhan/average_time_ranking.csv`
 - `output/wuhan/average_time_ranking.md`
+## Xiamen Variant
+
+The repository now also includes `xmmetro_accessibility.py` for Xiamen. The station list comes from `厦门地铁车站列表 - 地铁通 MetroMan.html` (saved from https://www.metroman.cn/cities/xiamen/stations).
+
+Run it like this:
+
+```bash
+python3 xmmetro_accessibility.py
+python3 xmmetro_accessibility.py --resolve-only
+python3 xmmetro_accessibility.py --max-routes 80
+python3 xmmetro_accessibility.py --db-path output/xiamen/amap_transit.db
+```
+
+Default Xiamen outputs:
+
+- `output/xiamen/stations_all.csv`
+- `output/xiamen/stations_by_line.md`
+- `output/xiamen/amap_station_matches.csv`
+- `output/xiamen/amap_station_matches.md`
+- `output/xiamen/amap_transit.db`
+- `output/xiamen/travel_time_matrix.csv`
+- `output/xiamen/travel_time_pairs.md`
+- `output/xiamen/average_time_ranking.csv`
+- `output/xiamen/average_time_ranking.md`
+
+Note: the MetroMan catalog may include lines that are not open yet (for example Line 4). Stations that AMap cannot match stay `unresolved` and their routes are left blank until the line opens and a rerun resolves them.
