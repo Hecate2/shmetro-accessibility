@@ -4,12 +4,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import json
 import math
 import re
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import aiosqlite
 from tqdm import tqdm
@@ -23,6 +26,7 @@ from amap_accessibility_common import (
     RouteResult,
     load_amap_credentials,
     load_env_file,
+    normalize_text,
     route_result_is_final,
     select_transit,
 )
@@ -171,6 +175,21 @@ def build_standard_parser(
         default=0,
         help="Optional cap for how many unresolved routes to crawl in this run; 0 means no cap",
     )
+    parser.add_argument(
+        "--lines",
+        default="",
+        help="Comma-separated line labels (e.g. \"2号线,10号线\"); restrict resolving and crawling to these lines",
+    )
+    parser.add_argument(
+        "--from-lines",
+        default="",
+        help="Comma-separated line labels restricting route origins; defaults to --lines when that is set",
+    )
+    parser.add_argument(
+        "--to-lines",
+        default="",
+        help="Comma-separated line labels restricting route destinations; defaults to --lines when that is set",
+    )
     parser.add_argument("--station-search-qps", type=float, default=3.01, help="Hard QPS cap for AMap station search requests")
     parser.add_argument("--route-plan-qps", type=float, default=3.01, help="Hard QPS cap for AMap route planning requests")
     parser.add_argument("--search-page-size", type=int, default=25, help="Page size for AMap POI search (1-25)")
@@ -193,6 +212,47 @@ def dedupe_strings(values: Sequence[str]) -> List[str]:
         if candidate and candidate not in deduped:
             deduped.append(candidate)
     return deduped
+
+
+def parse_line_filter(value: str) -> Optional[Set[str]]:
+    labels = {collapse_whitespace(part) for part in value.split(",")}
+    labels.discard("")
+    return labels or None
+
+
+def station_ids_for_lines(stations: Sequence[Station], line_labels: Optional[Set[str]]) -> Optional[Set[str]]:
+    if line_labels is None:
+        return None
+    return {station.station_id for station in stations if station.line_label in line_labels}
+
+
+def resolve_scope_from_args(
+    args: argparse.Namespace,
+    stations: Sequence[Station],
+) -> Tuple[Optional[Set[str]], Optional[Set[str]], Optional[Set[str]]]:
+    """Compute (resolve_ids, from_ids, to_ids) from CLI line filters.
+
+    from_ids/to_ids of None mean "all stations". resolve_ids is the union of
+    both route sides and limits which stations get resolved; None means all.
+    """
+    lines_filter = parse_line_filter(getattr(args, "lines", ""))
+    from_lines = parse_line_filter(getattr(args, "from_lines", "")) or lines_filter
+    to_lines = parse_line_filter(getattr(args, "to_lines", "")) or lines_filter
+    requested_labels = (from_lines or set()) | (to_lines or set())
+    if requested_labels:
+        available_labels = {station.line_label for station in stations}
+        unmatched = sorted(requested_labels - available_labels)
+        if unmatched:
+            raise SystemExit(
+                f"Unknown line label(s): {', '.join(unmatched)}. "
+                f"Available lines: {', '.join(sorted(available_labels))}"
+            )
+    from_ids = station_ids_for_lines(stations, from_lines)
+    to_ids = station_ids_for_lines(stations, to_lines)
+    resolve_ids: Optional[Set[str]] = None
+    if from_ids is not None or to_ids is not None:
+        resolve_ids = set(from_ids or {s.station_id for s in stations}) | set(to_ids or {s.station_id for s in stations})
+    return resolve_ids, from_ids, to_ids
 
 
 def build_station_id(line_order: int, station_slug: str) -> str:
@@ -441,13 +501,22 @@ class MetroManStationHTMLParser(HTMLParser):
         if self.in_heading:
             self.current_heading_parts.append(data)
 
+    @staticmethod
+    def _choose_station_name(parts: Sequence[str]) -> str:
+        if len(parts) > 2 and re.search(r"[一-鿿]", parts[2]):
+            return parts[2]
+        for part in parts[1:]:
+            if re.search(r"[一-鿿]", part):
+                return part
+        return parts[2] if len(parts) > 2 else ""
+
     def _append_station(self, data_key: str) -> None:
         parts = [part.strip() for part in data_key.split("|")]
         if len(parts) < 3:
             raise RuntimeError(f"Unexpected data-key format: {data_key}")
 
         station_slug = parts[0]
-        station_name = parts[2]
+        station_name = self._choose_station_name(parts)
         if not station_slug or not station_name:
             raise RuntimeError(f"Missing station slug or simplified Chinese name in data-key: {data_key}")
 
@@ -852,12 +921,14 @@ async def resolve_stations(
     stations: Sequence[Station],
     workers: int,
     rules: StationResolveRules,
+    only_ids: Optional[Set[str]] = None,
 ) -> Dict[str, ResolvedStation]:
     existing = await load_resolved_stations(conn)
     pending_stations = [
         station
         for station in stations
-        if station.station_id not in existing or existing[station.station_id].status == "unresolved"
+        if (only_ids is None or station.station_id in only_ids)
+        and (station.station_id not in existing or existing[station.station_id].status == "unresolved")
     ]
     if not pending_stations:
         return existing
@@ -921,6 +992,49 @@ async def resolve_stations(
     return existing
 
 
+def _error_category(reason: str) -> str:
+    if "INVALID_USER_IP" in reason:
+        return "invalid_ip"
+    if "DAILY_QUERY_OVER_LIMIT" in reason:
+        return "daily_limit"
+    if "CUQPS_HAS_EXCEEDED" in reason:
+        return "qps_limit"
+    if "SYSTEM_ERROR" in reason:
+        return "amap_system"
+    if "HTTP request failed" in reason or "nodename nor servname" in reason or "ConnectTimeout" in reason or "ConnectError" in reason:
+        return "network"
+    return "other"
+
+
+def _format_eta(seconds: float) -> str:
+    if not math.isfinite(seconds) or seconds < 0:
+        return "unknown"
+    total_minutes = int(seconds // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f"{days}d{hours:02d}h"
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def _status_line(
+    desc: str,
+    finished: int,
+    total: int,
+    started_at: float,
+    error_counts: Dict[str, int],
+    run_finished: Optional[int] = None,
+) -> str:
+    elapsed = max(time.monotonic() - started_at, 1e-6)
+    rate_base = finished if run_finished is None else run_finished
+    rate = rate_base / elapsed
+    remaining = max(total - finished, 0)
+    eta = _format_eta(remaining / rate) if rate > 0 else "unknown"
+    pct = f"{finished * 100 / total:.1f}%" if total else "100%"
+    errors = ",".join(f"{k}={v}" for k, v in sorted(error_counts.items())) or "none"
+    return f"[{desc}] {pct} done={finished}/{total} remaining={remaining} rate={rate:.2f}/s eta={eta} errors({errors})"
+
+
 async def crawl_routes(
     client: MetroAMapClient,
     conn: aiosqlite.Connection,
@@ -932,6 +1046,8 @@ async def crawl_routes(
     strategy: str,
     route_city_code: Callable[[Station], str],
     max_routes: Optional[int] = None,
+    from_ids: Optional[Set[str]] = None,
+    to_ids: Optional[Set[str]] = None,
 ) -> Dict[Tuple[str, str], RouteResult]:
     existing = await load_route_results(conn)
     resolved_ids = {
@@ -940,12 +1056,21 @@ async def crawl_routes(
         if resolved_station_can_plan_route(record)
     }
 
+    def pair_in_scope(origin: Station, destination: Station) -> bool:
+        if origin.station_id == destination.station_id:
+            return False
+        if from_ids is not None and origin.station_id not in from_ids:
+            return False
+        if to_ids is not None and destination.station_id not in to_ids:
+            return False
+        if origin.station_id not in resolved_ids or destination.station_id not in resolved_ids:
+            return False
+        return True
+
     pairs: List[Tuple[Station, Station]] = []
     for origin in stations:
         for destination in stations:
-            if origin.station_id == destination.station_id:
-                continue
-            if origin.station_id not in resolved_ids or destination.station_id not in resolved_ids:
+            if not pair_in_scope(origin, destination):
                 continue
             current = existing.get((origin.station_id, destination.station_id))
             if route_result_is_final(current):
@@ -958,9 +1083,7 @@ async def crawl_routes(
     completed = 0
     for origin in stations:
         for destination in stations:
-            if origin.station_id == destination.station_id:
-                continue
-            if origin.station_id not in resolved_ids or destination.station_id not in resolved_ids:
+            if not pair_in_scope(origin, destination):
                 continue
             current = existing.get((origin.station_id, destination.station_id))
             if route_result_is_final(current):
@@ -986,6 +1109,12 @@ async def crawl_routes(
             strategy=strategy,
         )
         return select_transit(payload, origin.station_id, destination.station_id)
+
+    run_error_counts: Dict[str, int] = {}
+    run_finished = 0
+    started_at = time.monotonic()
+    last_status_at = started_at
+    STATUS_INTERVAL_SEC = 60.0
 
     with tqdm(total=total, initial=completed, desc="Crawl routes", unit="route") as pbar:
         pending: Dict[asyncio.Task[RouteResult], Tuple[Station, Station]] = {}
@@ -1032,8 +1161,26 @@ async def crawl_routes(
                 )
                 existing[(result.from_id, result.to_id)] = result
                 if result.status in {"done", "no_valid_route"}:
+                    run_finished += 1
                     pbar.update(1)
+                else:
+                    category = _error_category(result.reason)
+                    run_error_counts[category] = run_error_counts.get(category, 0) + 1
+                    err_total = sum(run_error_counts.values())
+                    pbar.set_postfix_str(f"err={err_total}")
+                    if err_total <= 10 or err_total % 100 == 0:
+                        print(f"[crawl] ERROR ({err_total} total) {result.from_id} -> {result.to_id}: {result.reason[:160]}", flush=True)
+            now = time.monotonic()
+            if now - last_status_at >= STATUS_INTERVAL_SEC:
+                last_status_at = now
+                print(_status_line("crawl", completed + run_finished, total, started_at, run_error_counts, run_finished), flush=True)
             fill_pending()
+
+    print(
+        _status_line("crawl-summary", completed + run_finished, total, started_at, run_error_counts, run_finished)
+        + f" new_done={run_finished}",
+        flush=True,
+    )
 
     return existing
 
@@ -1308,6 +1455,169 @@ def write_average_ranking(stations: Sequence[Station], routes: Dict[Tuple[str, s
     ranking_md.write_text("\n".join(lines), encoding="utf-8-sig")
 
 
+def _parse_location(location: str) -> Optional[Tuple[float, float]]:
+    parts = [part.strip() for part in location.split(",")]
+    if len(parts) != 2:
+        return None
+    try:
+        return float(parts[0]), float(parts[1])
+    except ValueError:
+        return None
+
+
+def _minutes_rounded(duration_seconds: int) -> int:
+    return int(duration_seconds / 60 + 0.5)
+
+
+def write_frontend_json(
+    stations: Sequence[Station],
+    resolved: Dict[str, ResolvedStation],
+    routes: Dict[Tuple[str, str], RouteResult],
+    output_dir: Path,
+    network_name: str,
+    service_date: str,
+    service_time: str,
+    strategy: str,
+) -> Path:
+    """Write frontend-ready static JSON aligned with the CommuteTime data layout:
+
+    frontend/meta.json, frontend/stations.json, frontend/rows/<group>.json
+    """
+    node_avg: Dict[str, float] = {}
+    for origin in stations:
+        values = [
+            result.duration_seconds / 60
+            for destination in stations
+            if origin.station_id != destination.station_id
+            for result in [routes.get((origin.station_id, destination.station_id))]
+            if result is not None and result.status == "done" and isinstance(result.duration_seconds, int)
+        ]
+        node_avg[origin.station_id] = sum(values) / len(values) if values else math.nan
+
+    node_ranking = sorted(
+        stations,
+        key=lambda s: (math.inf if math.isnan(node_avg[s.station_id]) else node_avg[s.station_id], s.line_order, s.station_id),
+    )
+    node_rank = {station.station_id: index for index, station in enumerate(node_ranking, start=1)}
+
+    groups: Dict[str, List[Station]] = {}
+    for station in stations:
+        groups.setdefault(station.station_name, []).append(station)
+
+    group_records: List[Dict[str, Any]] = []
+    for name, members in groups.items():
+        coords = [
+            coord
+            for coord in (
+                _parse_location(resolved[m.station_id].location)
+                for m in members
+                if m.station_id in resolved and resolved[m.station_id].status == "resolved"
+            )
+            if coord is not None
+        ]
+        member_avgs = [node_avg[m.station_id] for m in members if not math.isnan(node_avg[m.station_id])]
+        group_records.append(
+            {
+                "name": name,
+                "lines": dedupe_strings([m.line_label for m in members]),
+                "nodes": [m.station_id for m in members],
+                "lng": sum(c[0] for c in coords) / len(coords) if coords else None,
+                "lat": sum(c[1] for c in coords) / len(coords) if coords else None,
+                "avg_minutes": round(sum(member_avgs) / len(member_avgs), 4) if member_avgs else None,
+                "rank": min((node_rank[m.station_id] for m in members), default=None),
+            }
+        )
+
+    group_records.sort(key=lambda g: (math.inf if g["avg_minutes"] is None else g["avg_minutes"], g["name"]))
+    gid_of_name = {record["name"]: f"g{index:03d}" for index, record in enumerate(group_records, start=1)}
+
+    frontend_dir = output_dir / "frontend"
+    rows_dir = frontend_dir / "rows"
+    rows_dir.mkdir(parents=True, exist_ok=True)
+    for stale in rows_dir.glob("*.json"):
+        stale.unlink()
+
+    group_by_gid = {gid_of_name[name]: members for name, members in groups.items()}
+
+    for gid, members in group_by_gid.items():
+        best: Dict[str, int] = {}
+        for origin in members:
+            for destination in stations:
+                if destination.station_name == origin.station_name:
+                    continue
+                result = routes.get((origin.station_id, destination.station_id))
+                if result is None or result.status != "done" or not isinstance(result.duration_seconds, int):
+                    continue
+                dest_gid = gid_of_name[destination.station_name]
+                minutes = _minutes_rounded(result.duration_seconds)
+                if dest_gid not in best or minutes < best[dest_gid]:
+                    best[dest_gid] = minutes
+        if best:
+            (rows_dir / f"{gid}.json").write_text(
+                json.dumps({"t": best}, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+
+    stations_payload = {
+        "groups": [
+            {
+                "id": gid_of_name[record["name"]],
+                "name": record["name"],
+                "lng": record["lng"],
+                "lat": record["lat"],
+                "lines": record["lines"],
+                "avg_minutes": record["avg_minutes"],
+                "rank": record["rank"],
+                "nodes": record["nodes"],
+            }
+            for record in group_records
+        ]
+    }
+    (frontend_dir / "stations.json").write_text(
+        json.dumps(stations_payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    status_counts: Dict[str, int] = {}
+    for result in routes.values():
+        status_counts[result.status] = status_counts.get(result.status, 0) + 1
+    unresolved_nodes = []
+    for station in stations:
+        record = resolved.get(station.station_id)
+        if record is None:
+            node_status = "missing"
+        elif record.status == "resolved" and record.location:
+            continue
+        elif record.status == "resolved":
+            node_status = "resolved_without_location"
+        else:
+            node_status = record.status
+        unresolved_nodes.append(
+            {
+                "station_id": station.station_id,
+                "line_label": station.line_label,
+                "station_name": station.station_name,
+                "status": node_status,
+            }
+        )
+    meta_payload = {
+        "city": network_name,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "service_date": service_date,
+        "service_time": service_time,
+        "strategy": strategy,
+        "node_count": len(stations),
+        "group_count": len(group_records),
+        "pair_status_counts": status_counts,
+        "unresolved_nodes": unresolved_nodes,
+    }
+    (frontend_dir / "meta.json").write_text(
+        json.dumps(meta_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return frontend_dir
+
+
 async def run_city_accessibility_main(
     args: argparse.Namespace,
     rules: StationResolveRules,
@@ -1330,6 +1640,13 @@ async def run_city_accessibility_main(
 
         write_station_catalog(stations, output_dir, network_name)
 
+        resolve_ids, from_ids, to_ids = resolve_scope_from_args(args, stations)
+        if resolve_ids is not None:
+            print(f"Line filter active: resolving {len(resolve_ids)} of {len(stations)} stations.")
+        if from_ids is not None or to_ids is not None:
+            scope_desc = f"from {len(from_ids) if from_ids is not None else 'ALL'} origins x to {len(to_ids) if to_ids is not None else 'ALL'} destinations"
+            print(f"Route scope: {scope_desc}.")
+
         resolved = await load_resolved_stations(conn)
         routes = await load_route_results(conn)
 
@@ -1346,7 +1663,7 @@ async def run_city_accessibility_main(
                 search_page_size=args.search_page_size,
             )
 
-            resolved = await resolve_stations(client, conn, stations, workers=args.resolve_workers, rules=rules)
+            resolved = await resolve_stations(client, conn, stations, workers=args.resolve_workers, rules=rules, only_ids=resolve_ids)
             write_station_resolution(stations, resolved, output_dir)
 
             if not args.resolve_only:
@@ -1362,12 +1679,25 @@ async def run_city_accessibility_main(
                     strategy=args.strategy,
                     route_city_code=rules.route_city_code,
                     max_routes=max_routes,
+                    from_ids=from_ids,
+                    to_ids=to_ids,
                 )
 
         write_station_catalog(stations, output_dir, network_name)
         write_station_resolution(stations, resolved, output_dir)
         write_route_outputs(stations, routes, output_dir, network_name)
         write_average_ranking(stations, routes, output_dir)
+        frontend_dir = write_frontend_json(
+            stations,
+            resolved,
+            routes,
+            output_dir,
+            network_name,
+            service_date=args.date,
+            service_time=args.time,
+            strategy=args.strategy,
+        )
+        print(f"Frontend JSON written to: {frontend_dir.resolve()}")
     finally:
         if client is not None:
             await client.aclose()
