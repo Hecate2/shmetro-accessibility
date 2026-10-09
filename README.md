@@ -11,7 +11,7 @@ This script now uses AMap (高德地图) Web Service APIs to estimate directed t
   - Example: `2号线 浦东南路` and `14号线 浦东南路` are treated as different nodes.
   - Example: `1/3/4号线 上海火车站` are treated as different nodes.
 - AMap station matching prefers line-specific subway exits so inconvenient transfers are reflected in walking time.
-- Route selection rejects any plan containing taxi or maglev.
+- Route selection rejects any plan containing taxi segments. Plans containing maglev or bus segments are currently kept.
 - Travel times are directional `A -> B`, not assumed symmetric.
 
 ## Prerequisites
@@ -92,10 +92,34 @@ Important flags:
 - `--max-routes` optionally limits how many unresolved routes are crawled in one run. Use this for small smoke tests before a full crawl.
 - `--lines "2号线,10号线"` restricts resolving and crawling to the given lines (comma-separated line labels).
 - `--from-lines` / `--to-lines` restrict route origins/destinations independently; each defaults to `--lines` when that is set. For example `--from-lines "2号线"` crawls only 2号线-station -> whole-network pairs.
-- `--station-search-qps` hard-caps station search requests per credential and defaults to `3.01` QPS.
-- `--route-plan-qps` hard-caps route planning requests per credential and defaults to `3.01` QPS.
+- `--station-search-qps` hard-caps station search requests per credential and defaults to `3.0` QPS.
+- `--route-plan-qps` hard-caps route planning requests per credential and defaults to `3.0` QPS.
 - `--pause` adds an optional extra delay after successful AMap calls and defaults to `0`.
-- `--strategy 7` uses AMap metro-priority public transit mode by default.
+- `--strategy` selects the AMap transit strategy; the default `0` asks for the
+  auto-recommended plan (metro-priority is available via `--strategy 7`).
+- `--group-reps` crawls one representative node per physical station cluster instead of every
+  line-specific node pair (~38% fewer API calls; per `analyze_group_spread.py` the representative
+  error is within 0.5 minutes for 99.94% of evaluated cluster pairs, max 5.9 minutes). Same-name
+  stations are split into separate clusters when their matched POIs are more than 300m apart
+  (e.g. 2/14号线 浦东南路), and the representative is chosen within `--from-lines`/`--to-lines`
+  scope. Any cluster pair with a final member result is treated as covered, so it composes with
+  previously crawled node-level data. When combined with `--from-lines`/`--to-lines`, coverage stays
+  cluster-level: clusters already covered through members outside the filtered lines are
+  skipped. With this flag the node-level CSV/ranking outputs are partial by
+  design; the frontend JSON (group level) is the authoritative output.
+- `--fill-symmetric` fills missing frontend rows with the crawled reverse-pair time (disclosed
+  as `estimated_pairs` in `frontend/meta.json`; ranking and CSV outputs stay measured-only).
+- `--max-trans N --recrawl-no-valid-route` retries previously `no_valid_route` pairs (except
+  maglev) with a higher transfer cap. Note the current `no_valid_route` rows are almost all
+  same-station cross-line pairs that AMap answers with walking (`no_transits`), so this mainly
+  matters for future cross-name failures.
+- `--reset-crawl-cache` discards prior `done`/`no_valid_route` rows when `--date`/`--time`/
+  `--strategy` differ from the cached crawl. Route results are not keyed by service params, so
+  without this flag a params conflict aborts the run instead of silently reusing stale data.
+  `--compute-only` never aborts: it warns and labels outputs with the stored params.
+- `python3 audit_routes.py --db output/amap_transit.db` audits crawl quality offline: triangle
+  inequality outliers, direction asymmetry, and intra-group constant offsets; findings are
+  stored in the `route_flags` table and `output/route_audit.md`.
 
 ## SQLite Schema
 
@@ -109,8 +133,15 @@ Tables:
 - `route_times`
   - Stores directed route results from `from_id -> to_id`.
   - `status='done'` means a valid public-transit route was found.
-  - `status='no_valid_route'` means AMap returned no acceptable plan after filtering taxi and maglev.
+  - `status='no_valid_route'` means AMap returned no acceptable plan after filtering taxi segments.
   - `status='error'` means the request failed and will be retried on the next run.
+- `crawl_params`
+  - Single-row record of the `--date`/`--time`/`strategy` the cached routes were crawled with.
+    `route_times` is not keyed by service params, so a params conflict aborts the run unless
+    `--reset-crawl-cache` is given.
+- `route_flags`
+  - Offline audit findings written by `audit_routes.py` (triangle-inequality outliers,
+    direction asymmetry, intra-group offsets).
 
 ## Output Files
 
@@ -139,11 +170,13 @@ converter:
   average minutes.
 - `rows/<g>.json` — `{"t": {dest_group_id: minutes}}` per origin group;
   minutes are integers, the minimum over member-node pairs, `status=done` only.
+  With `--fill-symmetric`, missing pairs are filled from the crawled reverse-pair
+  time and counted separately as `estimated_pairs` in `meta.json`.
 
 ## Notes
 
 - The route matrix is directional because entrances, walking time, and service patterns can differ by direction.
-- Each credential pair has an independent `3.01` QPS cap for station search and route planning by default.
+- Each credential pair has an independent `3.0` QPS cap for station search and route planning by default.
 - When multiple credential pairs are configured, the crawler rotates across them to raise aggregate throughput while keeping each pair inside its own cap.
 - AMap can still rate-limit requests, so modest concurrency is safer for long runs.
 - If some station nodes remain unresolved, their routes will be left blank in the outputs until a later rerun resolves them.
