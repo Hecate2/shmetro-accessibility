@@ -6,6 +6,7 @@ import asyncio
 import csv
 import json
 import math
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -27,7 +28,6 @@ from amap_accessibility_common import (
     load_amap_credentials,
     load_env_file,
     normalize_text,
-    route_result_is_final,
     select_transit,
 )
 
@@ -145,6 +145,14 @@ ROUTE_TIMES_TABLE_SQL = """
         PRIMARY KEY(from_id, to_id)
     )
 """
+CRAWL_PARAMS_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS crawl_params(
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        service_date TEXT NOT NULL,
+        service_time TEXT NOT NULL,
+        strategy TEXT NOT NULL
+    )
+"""
 
 
 def build_standard_parser(
@@ -176,6 +184,32 @@ def build_standard_parser(
         help="Optional cap for how many unresolved routes to crawl in this run; 0 means no cap",
     )
     parser.add_argument(
+        "--group-reps",
+        action="store_true",
+        help="Crawl one representative node per same-name station group instead of every line-specific node "
+        "node pair (~38%% fewer calls); any group pair with a final member result is treated as covered",
+    )
+    parser.add_argument(
+        "--fill-symmetric",
+        action="store_true",
+        help="Fill missing frontend rows with the crawled reverse-pair time (disclosed as estimated_pairs in meta.json)",
+    )
+    parser.add_argument(
+        "--max-trans",
+        default="5",
+        help="AMap transit max transfer count; raise (e.g. 8) together with --recrawl-no-valid-route for stubborn pairs",
+    )
+    parser.add_argument(
+        "--recrawl-no-valid-route",
+        action="store_true",
+        help="Treat prior no_valid_route pairs (except maglev) as pending again, e.g. after raising --max-trans",
+    )
+    parser.add_argument(
+        "--reset-crawl-cache",
+        action="store_true",
+        help="Discard prior done/no_valid_route rows when --date/--time/--strategy differ from the cached crawl",
+    )
+    parser.add_argument(
         "--lines",
         default="",
         help="Comma-separated line labels (e.g. \"2号线,10号线\"); restrict resolving and crawling to these lines",
@@ -190,8 +224,8 @@ def build_standard_parser(
         default="",
         help="Comma-separated line labels restricting route destinations; defaults to --lines when that is set",
     )
-    parser.add_argument("--station-search-qps", type=float, default=3.01, help="Hard QPS cap for AMap station search requests")
-    parser.add_argument("--route-plan-qps", type=float, default=3.01, help="Hard QPS cap for AMap route planning requests")
+    parser.add_argument("--station-search-qps", type=float, default=3.0, help="Hard QPS cap for AMap station search requests")
+    parser.add_argument("--route-plan-qps", type=float, default=3.0, help="Hard QPS cap for AMap route planning requests")
     parser.add_argument("--search-page-size", type=int, default=25, help="Page size for AMap POI search (1-25)")
     parser.add_argument("--date", default=default_service_date_value, help="Service date in YYYY-MM-DD, defaults to a workday")
     parser.add_argument("--time", default="7:15", help="Departure time, for example 7:15")
@@ -625,6 +659,7 @@ async def init_db(db_path: Path) -> aiosqlite.Connection:
     await conn.execute("PRAGMA synchronous=NORMAL;")
     await conn.execute("PRAGMA temp_store=MEMORY;")
     await conn.execute("PRAGMA busy_timeout=5000;")
+    await conn.execute(CRAWL_PARAMS_TABLE_SQL)
     await _migrate_legacy_station_amap(conn)
     await _create_station_amap_table(conn)
     await conn.execute(ROUTE_TIMES_TABLE_SQL)
@@ -748,6 +783,79 @@ async def load_route_results(conn: aiosqlite.Connection) -> Dict[Tuple[str, str]
     return results
 
 
+async def load_stored_service_params(conn: aiosqlite.Connection) -> Optional[Tuple[str, str, str]]:
+    cursor = await conn.execute("SELECT service_date, service_time, strategy FROM crawl_params WHERE id = 1")
+    row = await cursor.fetchone()
+    await cursor.close()
+    return (str(row[0]), str(row[1]), str(row[2])) if row else None
+
+
+async def save_stored_service_params(
+    conn: aiosqlite.Connection,
+    service_date: str,
+    service_time: str,
+    strategy: str,
+) -> None:
+    await conn.execute(
+        "INSERT OR REPLACE INTO crawl_params(id, service_date, service_time, strategy) VALUES(1, ?, ?, ?)",
+        (service_date, service_time, strategy),
+    )
+
+
+async def guard_service_params(
+    conn: aiosqlite.Connection,
+    args: argparse.Namespace,
+    routes: Dict[Tuple[str, str], RouteResult],
+) -> Tuple[Dict[Tuple[str, str], RouteResult], str, str, str]:
+    """缓存口径校验：route_times 不带 date/time 维度，改 --date/--time/--strategy 时
+    不得静默复用旧数据。返回 (routes, service_date, service_time, strategy)。
+
+    - --resolve-only 不触碰爬取缓存，直接放行；
+    - 存量库无 crawl_params 行（迁移前数据库）时至少警告，避免校验真空；
+    - compute-only 冲突时警告并用存量口径标注输出；
+    - 正常爬取冲突时必须显式 --reset-crawl-cache 清掉旧结果，否则退出。
+    """
+    if getattr(args, "resolve_only", False):
+        return routes, args.date, args.time, args.strategy
+
+    has_final_routes = any(result.status in ("done", "no_valid_route") for result in routes.values())
+    stored_params = await load_stored_service_params(conn)
+    if stored_params is None:
+        if has_final_routes:
+            print(
+                "WARNING: the route cache has final rows but no recorded crawl params (pre-migration database); "
+                "treating the requested --date/--time/--strategy as the cache params. If the cache was crawled "
+                "with different params, outputs will be mislabeled until a crawl pins the correct params.",
+                flush=True,
+            )
+        return routes, args.date, args.time, args.strategy
+
+    requested = (args.date, args.time, args.strategy)
+    if stored_params == requested or not has_final_routes:
+        return routes, args.date, args.time, args.strategy
+
+    if args.compute_only:
+        print(
+            f"WARNING: cached crawl used date={stored_params[0]} time={stored_params[1]} strategy={stored_params[2]}, "
+            f"but --date/--time/--strategy request {requested}; labeling outputs with the stored params.",
+            flush=True,
+        )
+        return routes, stored_params[0], stored_params[1], stored_params[2]
+
+    if not args.reset_crawl_cache:
+        raise SystemExit(
+            f"Cached crawl data used date={stored_params[0]} time={stored_params[1]} strategy={stored_params[2]}, "
+            f"which conflicts with --date {args.date} --time {args.time} --strategy {args.strategy}. "
+            "Route results are not keyed by service params, so continuing would silently reuse stale data. "
+            "Re-run with matching params, or add --reset-crawl-cache to discard prior results and recrawl."
+        )
+
+    await conn.execute("DELETE FROM route_times WHERE status IN ('done', 'no_valid_route')")
+    routes = await load_route_results(conn)
+    print("Reset crawl cache: deleted prior done/no_valid_route rows for the new service params.", flush=True)
+    return routes, args.date, args.time, args.strategy
+
+
 def resolved_station_can_plan_route(record: Optional[ResolvedStation]) -> bool:
     return record is not None and record.status == "resolved" and bool(record.location) and bool(record.poi_id)
 
@@ -808,7 +916,10 @@ class MetroAMapClient(AMapClient):
         service_date: str,
         service_time: str,
         strategy: str,
+        max_trans: str = "5",
     ) -> Dict[str, Any]:
+        if not str(max_trans).isdigit():
+            raise ValueError(f"max_trans must be a non-negative integer, got {max_trans!r}")
         credential = await self._acquire_route_plan_credential()
         return await self._request_json(
             AMAP_TRANSIT_URL,
@@ -822,7 +933,7 @@ class MetroAMapClient(AMapClient):
                 "strategy": strategy,
                 "AlternativeRoute": "8",
                 "nightflag": "0",
-                "max_trans": "5",
+                "max_trans": max_trans,
                 "date": service_date,
                 "time": service_time,
                 "show_fields": "cost",
@@ -1035,6 +1146,164 @@ def _status_line(
     return f"[{desc}] {pct} done={finished}/{total} remaining={remaining} rate={rate:.2f}/s eta={eta} errors({errors})"
 
 
+def _result_final_for_run(result: Optional[RouteResult], retry_no_valid_route: bool) -> bool:
+    """本次运行是否把该结果当作最终态。retry_no_valid_route 时把非磁悬浮的
+    no_valid_route（如被 max_trans 卡死的远郊对）重新纳入待爬。"""
+    if result is None:
+        return False
+    if result.status == "done":
+        return True
+    if result.status == "no_valid_route":
+        if result.reason == "contains_maglev":
+            return True
+        return not retry_no_valid_route
+    return False
+
+
+def _build_node_pairs(
+    stations: Sequence[Station],
+    resolved_ids: Set[str],
+    existing: Dict[Tuple[str, str], RouteResult],
+    from_ids: Optional[Set[str]],
+    to_ids: Optional[Set[str]],
+    retry_no_valid_route: bool = False,
+) -> Tuple[List[Tuple[Station, Station]], int]:
+    def pair_in_scope(origin: Station, destination: Station) -> bool:
+        if origin.station_id == destination.station_id:
+            return False
+        if from_ids is not None and origin.station_id not in from_ids:
+            return False
+        if to_ids is not None and destination.station_id not in to_ids:
+            return False
+        if origin.station_id not in resolved_ids or destination.station_id not in resolved_ids:
+            return False
+        return True
+
+    pairs: List[Tuple[Station, Station]] = []
+    completed = 0
+    for origin in stations:
+        for destination in stations:
+            if not pair_in_scope(origin, destination):
+                continue
+            current = existing.get((origin.station_id, destination.station_id))
+            if _result_final_for_run(current, retry_no_valid_route):
+                completed += 1
+                continue
+            pairs.append((origin, destination))
+    return pairs, completed
+
+
+def _haversine_meters(coord_a: Tuple[float, float], coord_b: Tuple[float, float]) -> float:
+    lon1, lat1 = coord_a
+    lon2, lat2 = coord_b
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    h = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 6371000.0 * 2 * math.asin(math.sqrt(h))
+
+
+def _cluster_group_members(
+    members: Sequence[Station],
+    resolved_stations: Dict[str, ResolvedStation],
+    radius_meters: float = 300.0,
+) -> List[List[Station]]:
+    """同名成员按已解析 POI 位置连通聚类，成员间距离 <= radius 归同簇。
+
+    绝大多数同名组各线共享同一 POI（距离 0），但个别站实为分离站体
+    （如 2/14 号线浦东南路相距约 660m、2/17 号线国家会展中心约 690m），
+    互相代表会引入最长 11 分钟的误差，必须拆簇各自选代表。
+    """
+    coords: Dict[str, Tuple[float, float]] = {}
+    for member in members:
+        record = resolved_stations.get(member.station_id)
+        if record is None or record.status != "resolved":
+            continue
+        coord = _parse_location(record.location)
+        if coord is not None:
+            coords[member.station_id] = coord
+    parent = {member.station_id: member.station_id for member in members}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    ids = list(coords)
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            if _haversine_meters(coords[ids[i]], coords[ids[j]]) <= radius_meters:
+                root_i, root_j = find(ids[i]), find(ids[j])
+                if root_i != root_j:
+                    parent[root_i] = root_j
+
+    clusters: Dict[str, List[Station]] = {}
+    for member in members:
+        clusters.setdefault(find(member.station_id), []).append(member)
+    return list(clusters.values())
+
+
+def _build_group_rep_pairs(
+    stations: Sequence[Station],
+    resolved_ids: Set[str],
+    resolved_stations: Dict[str, ResolvedStation],
+    existing: Dict[Tuple[str, str], RouteResult],
+    from_ids: Optional[Set[str]],
+    to_ids: Optional[Set[str]],
+    retry_no_valid_route: bool = False,
+) -> Tuple[List[Tuple[Station, Station]], int]:
+    """组代表元模式：物理站簇之间只爬 代表->代表 一对。
+
+    同名组先按 POI 距离聚类（>300m 拆簇），簇对只要任一成员对已有最终结果即视为
+    已覆盖。代表元选取受 --from-lines/--to-lines 约束：优先选该侧过滤范围内
+    已解析的成员，避免越过指定线路（如 --from-lines 8号线 时以 1号线 节点出发）。
+    精度论证见 analyze_group_spread.py（修正后：99.9% 组代表误差 <=0.5 分钟，
+    >3 分钟尾巴集中在个别换乘站）。
+    """
+    name_groups: Dict[str, List[Station]] = {}
+    for station in stations:
+        name_groups.setdefault(station.station_name, []).append(station)
+    clusters: List[List[Station]] = []
+    for members in name_groups.values():
+        clusters.extend(_cluster_group_members(members, resolved_stations))
+    station_by_id = {station.station_id: station for station in stations}
+
+    def pick_rep(members: Sequence[Station], id_filter: Optional[Set[str]]) -> Optional[Station]:
+        ordered = sorted(members, key=lambda s: (s.line_order, s.station_id))
+        pool = [s for s in ordered if s.station_id in resolved_ids]
+        if id_filter is not None:
+            pool = [s for s in pool if s.station_id in id_filter]
+        return pool[0] if pool else None
+
+    pairs: List[Tuple[Station, Station]] = []
+    completed = 0
+    for origin_cluster in clusters:
+        if from_ids is not None and not any(s.station_id in from_ids for s in origin_cluster):
+            continue
+        origin_rep = pick_rep(origin_cluster, from_ids)
+        if origin_rep is None:
+            continue
+        for dest_cluster in clusters:
+            if dest_cluster is origin_cluster:
+                continue
+            if to_ids is not None and not any(s.station_id in to_ids for s in dest_cluster):
+                continue
+            member_results = [
+                existing.get((origin.station_id, dest.station_id))
+                for origin in origin_cluster
+                for dest in dest_cluster
+            ]
+            if any(_result_final_for_run(result, retry_no_valid_route) for result in member_results):
+                completed += 1
+                continue
+            dest_rep = pick_rep(dest_cluster, to_ids)
+            if dest_rep is None:
+                continue
+            pairs.append((station_by_id[origin_rep.station_id], station_by_id[dest_rep.station_id]))
+    return pairs, completed
+
+
 async def crawl_routes(
     client: MetroAMapClient,
     conn: aiosqlite.Connection,
@@ -1048,6 +1317,9 @@ async def crawl_routes(
     max_routes: Optional[int] = None,
     from_ids: Optional[Set[str]] = None,
     to_ids: Optional[Set[str]] = None,
+    use_group_representatives: bool = False,
+    max_trans: str = "5",
+    retry_no_valid_route: bool = False,
 ) -> Dict[Tuple[str, str], RouteResult]:
     existing = await load_route_results(conn)
     resolved_ids = {
@@ -1056,38 +1328,27 @@ async def crawl_routes(
         if resolved_station_can_plan_route(record)
     }
 
-    def pair_in_scope(origin: Station, destination: Station) -> bool:
-        if origin.station_id == destination.station_id:
-            return False
-        if from_ids is not None and origin.station_id not in from_ids:
-            return False
-        if to_ids is not None and destination.station_id not in to_ids:
-            return False
-        if origin.station_id not in resolved_ids or destination.station_id not in resolved_ids:
-            return False
-        return True
+    pairs: List[Tuple[Station, Station]]
+    completed: int
 
-    pairs: List[Tuple[Station, Station]] = []
-    for origin in stations:
-        for destination in stations:
-            if not pair_in_scope(origin, destination):
-                continue
-            current = existing.get((origin.station_id, destination.station_id))
-            if route_result_is_final(current):
-                continue
-            pairs.append((origin, destination))
+    if use_group_representatives:
+        if from_ids is not None or to_ids is not None:
+            print(
+                "note: --group-reps coverage is cluster-level; clusters already covered via member "
+                "results from lines outside --from-lines/--to-lines are skipped.",
+                flush=True,
+            )
+        pairs, completed = _build_group_rep_pairs(
+            stations, resolved_ids, resolved_stations, existing, from_ids, to_ids, retry_no_valid_route
+        )
+    else:
+        pairs, completed = _build_node_pairs(stations, resolved_ids, existing, from_ids, to_ids, retry_no_valid_route)
 
+    # 固定种子打乱：避免固定顺序导致 capped run 只推进同一条前沿、
+    # error 对反复占据队首、覆盖向先爬线路倾斜。
+    random.Random(20261009).shuffle(pairs)
     if max_routes is not None and max_routes > 0:
         pairs = pairs[:max_routes]
-
-    completed = 0
-    for origin in stations:
-        for destination in stations:
-            if not pair_in_scope(origin, destination):
-                continue
-            current = existing.get((origin.station_id, destination.station_id))
-            if route_result_is_final(current):
-                completed += 1
 
     total = completed + len(pairs)
     if not pairs:
@@ -1107,6 +1368,7 @@ async def crawl_routes(
             service_date=service_date,
             service_time=service_time,
             strategy=strategy,
+            max_trans=max_trans,
         )
         return select_transit(payload, origin.station_id, destination.station_id)
 
@@ -1478,10 +1740,14 @@ def write_frontend_json(
     service_date: str,
     service_time: str,
     strategy: str,
+    fill_symmetric: bool = False,
 ) -> Path:
     """Write frontend-ready static JSON aligned with the CommuteTime data layout:
 
     frontend/meta.json, frontend/stations.json, frontend/rows/<group>.json
+
+    fill_symmetric=True 时，缺失对的行值用已爬反向对的时间兜底（估计值），
+    meta.json 单独披露 estimated_pairs，不影响 ranking/CSV 的实测口径。
     """
     node_avg: Dict[str, float] = {}
     for origin in stations:
@@ -1539,19 +1805,34 @@ def write_frontend_json(
 
     group_by_gid = {gid_of_name[name]: members for name, members in groups.items()}
 
+    estimated_pairs = 0
     for gid, members in group_by_gid.items():
         best: Dict[str, int] = {}
+        best_estimated: Dict[str, bool] = {}
         for origin in members:
             for destination in stations:
                 if destination.station_name == origin.station_name:
                     continue
-                result = routes.get((origin.station_id, destination.station_id))
-                if result is None or result.status != "done" or not isinstance(result.duration_seconds, int):
-                    continue
                 dest_gid = gid_of_name[destination.station_name]
+                result = routes.get((origin.station_id, destination.station_id))
+                estimated = False
+                if result is None or result.status != "done" or not isinstance(result.duration_seconds, int):
+                    if not fill_symmetric:
+                        continue
+                    reverse = routes.get((destination.station_id, origin.station_id))
+                    if (
+                        reverse is None
+                        or reverse.status != "done"
+                        or not isinstance(reverse.duration_seconds, int)
+                    ):
+                        continue
+                    result = reverse
+                    estimated = True
                 minutes = _minutes_rounded(result.duration_seconds)
                 if dest_gid not in best or minutes < best[dest_gid]:
                     best[dest_gid] = minutes
+                    best_estimated[dest_gid] = estimated
+        estimated_pairs += sum(1 for value in best_estimated.values() if value)
         if best:
             (rows_dir / f"{gid}.json").write_text(
                 json.dumps({"t": best}, ensure_ascii=False, separators=(",", ":")),
@@ -1609,6 +1890,7 @@ def write_frontend_json(
         "node_count": len(stations),
         "group_count": len(group_records),
         "pair_status_counts": status_counts,
+        "estimated_pairs": estimated_pairs,
         "unresolved_nodes": unresolved_nodes,
     }
     (frontend_dir / "meta.json").write_text(
@@ -1650,6 +1932,8 @@ async def run_city_accessibility_main(
         resolved = await load_resolved_stations(conn)
         routes = await load_route_results(conn)
 
+        routes, service_date, service_time, strategy = await guard_service_params(conn, args, routes)
+
         if not args.compute_only:
             env_values = load_env_file(Path(args.env_file))
             credentials = load_amap_credentials(env_values)
@@ -1667,6 +1951,7 @@ async def run_city_accessibility_main(
             write_station_resolution(stations, resolved, output_dir)
 
             if not args.resolve_only:
+                await save_stored_service_params(conn, service_date, service_time, strategy)
                 max_routes = args.max_routes if args.max_routes > 0 else None
                 routes = await crawl_routes(
                     client=client,
@@ -1674,13 +1959,16 @@ async def run_city_accessibility_main(
                     stations=stations,
                     resolved_stations=resolved,
                     workers=args.route_workers,
-                    service_date=args.date,
-                    service_time=args.time,
-                    strategy=args.strategy,
+                    service_date=service_date,
+                    service_time=service_time,
+                    strategy=strategy,
                     route_city_code=rules.route_city_code,
                     max_routes=max_routes,
                     from_ids=from_ids,
                     to_ids=to_ids,
+                    use_group_representatives=args.group_reps,
+                    max_trans=args.max_trans,
+                    retry_no_valid_route=args.recrawl_no_valid_route,
                 )
 
         write_station_catalog(stations, output_dir, network_name)
@@ -1693,9 +1981,10 @@ async def run_city_accessibility_main(
             routes,
             output_dir,
             network_name,
-            service_date=args.date,
-            service_time=args.time,
-            strategy=args.strategy,
+            service_date=service_date,
+            service_time=service_time,
+            strategy=strategy,
+            fill_symmetric=args.fill_symmetric,
         )
         print(f"Frontend JSON written to: {frontend_dir.resolve()}")
     finally:

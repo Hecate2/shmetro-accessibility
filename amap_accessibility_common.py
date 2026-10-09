@@ -178,16 +178,6 @@ def transit_has_forbidden_mode(transit: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def route_result_is_final(result: Optional[RouteResult]) -> bool:
-    if result is None:
-        return False
-    if result.status == "done":
-        return True
-    if result.status == "no_valid_route" and result.reason != "contains_maglev":
-        return True
-    return False
-
-
 def select_transit(route_payload: Dict[str, Any], from_id: str, to_id: str) -> RouteResult:
     transits = (route_payload.get("route") or {}).get("transits") or []
     if not transits:

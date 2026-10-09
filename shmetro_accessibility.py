@@ -20,8 +20,10 @@ from metro_accessibility_common import (
     load_resolved_stations,
     load_route_results,
     load_station_catalog_with_source,
+    guard_service_params,
     resolve_scope_from_args,
     resolve_stations,
+    save_stored_service_params,
     sync_station_catalog,
     write_average_ranking,
     write_frontend_json,
@@ -191,8 +193,40 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Comma-separated line labels restricting route destinations; defaults to --lines when that is set",
     )
-    parser.add_argument("--station-search-qps", type=float, default=3.01, help="Hard QPS cap for AMap station search requests")
-    parser.add_argument("--route-plan-qps", type=float, default=3.01, help="Hard QPS cap for AMap route planning requests")
+    parser.add_argument(
+        "--group-reps",
+        action="store_true",
+        help="Crawl one representative node per same-name station group instead of every line-specific node "
+        "node pair (~38%% fewer calls); any group pair with a final member result is treated as covered",
+    )
+    parser.add_argument(
+        "--max-routes",
+        type=int,
+        default=0,
+        help="Optional cap for how many unresolved routes to crawl in this run; 0 means no cap",
+    )
+    parser.add_argument(
+        "--fill-symmetric",
+        action="store_true",
+        help="Fill missing frontend rows with the crawled reverse-pair time (disclosed as estimated_pairs in meta.json)",
+    )
+    parser.add_argument(
+        "--max-trans",
+        default="5",
+        help="AMap transit max transfer count; raise (e.g. 8) together with --recrawl-no-valid-route for stubborn pairs",
+    )
+    parser.add_argument(
+        "--recrawl-no-valid-route",
+        action="store_true",
+        help="Treat prior no_valid_route pairs (except maglev) as pending again, e.g. after raising --max-trans",
+    )
+    parser.add_argument(
+        "--reset-crawl-cache",
+        action="store_true",
+        help="Discard prior done/no_valid_route rows when --date/--time/--strategy differ from the cached crawl",
+    )
+    parser.add_argument("--station-search-qps", type=float, default=3.0, help="Hard QPS cap for AMap station search requests")
+    parser.add_argument("--route-plan-qps", type=float, default=3.0, help="Hard QPS cap for AMap route planning requests")
     parser.add_argument("--date", default=default_service_date(), help="Service date in YYYY-MM-DD, defaults to a workday")
     parser.add_argument("--time", default="7:15", help="Departure time, for example 7:15")
     parser.add_argument("--strategy", default="0", help="AMap transit strategy, default 0 is the auto-recommended route")
@@ -233,6 +267,8 @@ async def main() -> None:
         resolved = await load_resolved_stations(conn)
         routes = await load_route_results(conn)
 
+        routes, service_date, service_time, strategy = await guard_service_params(conn, args, routes)
+
         if not args.compute_only:
             env_values = load_env_file(Path(args.env_file))
             credentials = load_amap_credentials(env_values)
@@ -250,18 +286,24 @@ async def main() -> None:
             write_station_resolution(stations, resolved, output_dir)
 
             if not args.resolve_only:
+                await save_stored_service_params(conn, service_date, service_time, strategy)
+                max_routes = args.max_routes if args.max_routes > 0 else None
                 routes = await crawl_routes(
                     client=client,
                     conn=conn,
                     stations=stations,
                     resolved_stations=resolved,
                     workers=args.route_workers,
-                    service_date=args.date,
-                    service_time=args.time,
-                    strategy=args.strategy,
+                    service_date=service_date,
+                    service_time=service_time,
+                    strategy=strategy,
                     route_city_code=RESOLVE_RULES.route_city_code,
+                    max_routes=max_routes,
                     from_ids=from_ids,
                     to_ids=to_ids,
+                    use_group_representatives=args.group_reps,
+                    max_trans=args.max_trans,
+                    retry_no_valid_route=args.recrawl_no_valid_route,
                 )
 
         write_station_catalog_csv(stations, output_dir)
@@ -274,9 +316,10 @@ async def main() -> None:
             routes,
             output_dir,
             "Shanghai Metro",
-            service_date=args.date,
-            service_time=args.time,
-            strategy=args.strategy,
+            service_date=service_date,
+            service_time=service_time,
+            strategy=strategy,
+            fill_symmetric=args.fill_symmetric,
         )
         print(f"Frontend JSON written to: {frontend_dir.resolve()}")
     finally:
