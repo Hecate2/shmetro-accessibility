@@ -90,6 +90,8 @@ Important flags:
 - `--route-workers` controls concurrent route requests.
 - `--resolve-workers` controls concurrent station matching requests.
 - `--max-routes` optionally limits how many unresolved routes are crawled in one run. Use this for small smoke tests before a full crawl.
+- `--lines "2号线,10号线"` restricts resolving and crawling to the given lines (comma-separated line labels).
+- `--from-lines` / `--to-lines` restrict route origins/destinations independently; each defaults to `--lines` when that is set. For example `--from-lines "2号线"` crawls only 2号线-station -> whole-network pairs.
 - `--station-search-qps` hard-caps station search requests per credential and defaults to `3.01` QPS.
 - `--route-plan-qps` hard-caps route planning requests per credential and defaults to `3.01` QPS.
 - `--pause` adds an optional extra delay after successful AMap calls and defaults to `0`.
@@ -119,6 +121,24 @@ Tables:
 - `output/travel_time_pairs.md`
 - `output/average_time_ranking.csv`
 - `output/average_time_ranking.md`
+- `output/frontend/meta.json`
+- `output/frontend/stations.json`
+- `output/frontend/rows/<group>.json`
+
+### Frontend JSON
+
+Every run also rebuilds `output/frontend/`, a static JSON bundle that downstream
+tools (e.g. CommuteTime) can consume directly without writing their own
+converter:
+
+- `meta.json` — city, generation time, `--date`/`--time`/`--strategy` 口径,
+  node/group counts, route status counts, and the list of unresolved nodes.
+- `stations.json` — station groups aggregated by station name (same-name nodes
+  across lines merged): group id (`g001`...), mean GCJ-02 coordinate, lines,
+  average minutes, best member rank, member node ids. Groups are ordered by
+  average minutes.
+- `rows/<g>.json` — `{"t": {dest_group_id: minutes}}` per origin group;
+  minutes are integers, the minimum over member-node pairs, `status=done` only.
 
 ## Notes
 
