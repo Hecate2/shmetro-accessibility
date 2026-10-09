@@ -94,7 +94,13 @@ Important flags:
 - `--from-lines` / `--to-lines` restrict route origins/destinations independently; each defaults to `--lines` when that is set. For example `--from-lines "2号线"` crawls only 2号线-station -> whole-network pairs.
 - `--station-search-qps` hard-caps station search requests per credential and defaults to `3.0` QPS.
 - `--route-plan-qps` hard-caps route planning requests per credential and defaults to `3.0` QPS.
+- `--search-page-size` sets the AMap POI search page size (1-25, default `25`).
 - `--pause` adds an optional extra delay after successful AMap calls and defaults to `0`.
+- `--timeout` sets the HTTP timeout in seconds (default `20`).
+- `--retries` sets the retry count for transient AMap errors (default `4`).
+- `--output` sets the output directory (default `output`).
+- `--stations-html` sets the MetroMan station-list HTML file to parse; each variant defaults to its bundled HTML.
+- `--env-file` sets the environment file containing the AMap key/secret (default `.env`).
 - `--strategy` selects the AMap transit strategy; the default `0` asks for the
   auto-recommended plan (metro-priority is available via `--strategy 7`).
 - `--group-reps` crawls one representative node per physical station cluster instead of every
@@ -120,6 +126,14 @@ Important flags:
 - `python3 audit_routes.py --db output/amap_transit.db` audits crawl quality offline: triangle
   inequality outliers, direction asymmetry, and intra-group constant offsets; findings are
   stored in the `route_flags` table and `output/route_audit.md`.
+- `python3 analyze_group_spread.py --db output/amap_transit.db` is an offline estimator for
+  `--group-reps`: it clusters same-name stations by POI distance, counts how many node pairs
+  cluster coverage would save, and reports the representative error (max/percentile minutes)
+  so you can decide whether the flag is accurate enough for your data.
+- Crawl progress prints one status line per interval:
+  `[crawl] <pct> done=<finished>/<total> remaining=<n> rate=<pairs/s> eta=<hh:mm|XdYh> errors(<kind=count>)`,
+  where `done` includes cache hits, `rate` counts only requests made in this run, and a final
+  `[crawl-summary]` line adds `new_done=<count>`.
 
 ## SQLite Schema
 
